@@ -52,7 +52,7 @@ class BeyondMimicPolicy(Policy):
 
         self.motion = MotionLoader(
             motion_file=f"{self.task_path}/{self.cfg.motion_path}",
-            track_body_names=[self.cfg.anchor_body_name],
+            track_body_names=self._motion_track_body_names(),
             track_joint_names=self.robot.cfg.sim_joint_names,
             default_motion_body_names=self.robot.cfg.sim_body_names,
             default_motion_joint_names=self.robot.cfg.sim_joint_names,
@@ -63,6 +63,13 @@ class BeyondMimicPolicy(Policy):
 
         self.default_joint_pos = self.robot.default_joint_pos.to(
             self.cfg.device)
+
+    def _motion_track_body_names(self) -> list[str]:
+        """Motion bodies loaded from the motion file.
+
+        The anchor body is always first; subclasses may append more bodies.
+        """
+        return [self.cfg.anchor_body_name]
 
     def reset(self) -> None:
         self.init_root_yaw_quat_w_inv = lab_math.quat_inv(

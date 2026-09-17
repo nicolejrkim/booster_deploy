@@ -51,6 +51,43 @@ The checkpoint suffix selects the inference backend automatically:
 - `.onnx`: ONNX Runtime with the CPU execution provider
 make sure `onnxruntime` is installed in the deployment environment.
 
+### BM154 motion tracking (K1)
+
+`tasks/bm154/` deploys BeyondMimic policies trained with the BM154
+observation (`Tracking-Flat-K1-BM154-v0` in `whole_body_tracking`): reference
+joint positions/velocities, the reference root's projected gravity, the robot's
+projected gravity, the gyro, joint positions relative to the default pose,
+joint velocities and the previous action (119 dims on the 22-DOF K1). All terms
+are directly measurable on the robot, so no anchor position or base velocity
+estimate is needed.
+
+Registered K1 tasks: `k1_bm154_jamesbrown`, `k1_bm154_floss`,
+`k1_bm154_boogle`. The controller configuration pins the training PD gains,
+effort limits, default pose and per-joint action scale so the action mapping
+matches training; tune the real-robot `Kd` per the note above if needed.
+
+```bash
+python scripts/deploy.py --task k1_bm154_jamesbrown --mujoco
+```
+
+#### Exporting an RSL-RL checkpoint
+
+BM154 runs are trained with `empirical_normalization=True`, so the raw
+`model_<iter>.pt` cannot be loaded directly. `scripts/export_rsl_rl_policy.py`
+rebuilds the actor MLP, folds the observation normalizer in front of it and
+writes both a TorchScript (`.pt`) and an ONNX (`.onnx`) file:
+
+```bash
+python scripts/export_rsl_rl_policy.py \
+    --checkpoint <whole_body_tracking>/logs/rsl_rl/k1_flat/<run>/model_9999.pt \
+    --output tasks/bm154/robots/k1/models/<name>
+```
+
+The MLP layout is inferred from the checkpoint; the activation and the
+normalization flag are read from `params/agent.yaml` next to it when present.
+Copy the matching motion `.npz` into `tasks/bm154/robots/k1/motions/` and add a
+`ControllerCfg` in `tasks/bm154/robots/k1/__init__.py` that points to both.
+
 ### Run Sim2Sim (MuJoCo)
 
 - Download and install BoosterAssets:

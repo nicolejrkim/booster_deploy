@@ -9,6 +9,11 @@ tasks/**/motions/*
 !tasks/locomotion/robots/k1/models/k1_walk.pt
 !tasks/locomotion/robots/t1/models/t1_walk.pt
 !tasks/locomotion/robots/t2/models/t2_walk.pt
+# K1 BM154 release assets are versioned.
+!tasks/bm154/robots/k1/models/*
+!tasks/bm154/robots/k1/motions/*
+!tasks/bm154/robots/*/models/.gitkeep
+!tasks/bm154/robots/*/motions/.gitkeep
 # T1 BeyondMimic release assets are versioned.
 !tasks/beyond_mimic/robots/t1/models/*
 !tasks/beyond_mimic/robots/t1/motions/*
