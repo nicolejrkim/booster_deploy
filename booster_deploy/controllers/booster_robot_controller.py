@@ -16,6 +16,8 @@ from rclpy.executors import SingleThreadedExecutor, ExternalShutdownException
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from booster_interface.msg import BoosterApiReqMsg, LowState, LowCmd, MotorCmd
 from booster_interface.srv import RpcService
+from rclpy.qos import DurabilityPolicy
+from std_msgs.msg import String
 
 
 class _RobotModeInt:
@@ -28,6 +30,7 @@ class _RobotModeInt:
 
 _LOC_API_CHANGE_MODE = 2000
 _LOC_API_GET_STATUS = 2018
+_LOC_API_GET_UP_WITH_MODE = 2025
 
 from .controller_cfg import ControllerCfg
 from .base_controller import BaseController, BoosterRobot
@@ -72,6 +75,10 @@ class BoosterRobotPortal:
         self.fsm_executor_request = mp.Value("i", -1)
         self._fsm = None
         self._fsm_walk_first = False
+        # State requested over the booster_deploy/fsm_request topic (monitor,
+        # `ros2 topic pub`), consumed by the supervisor loop.
+        self._fsm_topic_request: str | None = None
+        self._fsm_topic_lock = threading.Lock()
         self.is_running = True
         def signal_handler(sig, frame):
             if mp.current_process().name == "MainProcess":
@@ -88,6 +95,7 @@ class BoosterRobotPortal:
         self._safety_abort = False
         self.inference_process = None  # Inference process reference
         self.low_cmd_publisher: rclpy.publisher.Publisher = None
+        self.fsm_state_publisher = None
         self.low_state_thread = None
         self.low_cmd_process: mp.Process | None = None
 
@@ -181,6 +189,13 @@ class BoosterRobotPortal:
                     history=HistoryPolicy.KEEP_LAST,
                 ),
             )
+            low_state_node.create_subscription(
+                String,
+                "booster_deploy/fsm_request",
+                self._fsm_request_handler,
+                QoSProfile(depth=4, reliability=ReliabilityPolicy.RELIABLE,
+                           history=HistoryPolicy.KEEP_LAST),
+            )
 
             executor = SingleThreadedExecutor()
             executor.add_node(low_state_node)
@@ -260,6 +275,37 @@ class BoosterRobotPortal:
             self.running = False
             self.exit_event.set()
 
+    def _fsm_request_handler(self, msg: String) -> None:
+        with self._fsm_topic_lock:
+            self._fsm_topic_request = msg.data.strip().upper()
+
+    def _get_up(self) -> bool:
+        """Booster's built-in get-up into Walking mode (blocking, polled)."""
+        version = int(self.cfg.booster.getup_version)
+        self.logger.info("Requesting get-up (version %d)...", version)
+        ok, _ = self._call_booster_rpc(
+            _LOC_API_GET_UP_WITH_MODE,
+            {"mode": _RobotModeInt.kWalking, "version": version},
+        )
+        if not ok:
+            self.logger.error("Get-up request was refused")
+            return False
+        deadline = time.perf_counter() + self.cfg.booster.getup_timeout_s
+        while time.perf_counter() < deadline and not self.exit_event.is_set():
+            time.sleep(0.5)
+            status_ok, status = self._call_booster_rpc(_LOC_API_GET_STATUS)
+            if (
+                status_ok and status is not None
+                and int(status.get("current_mode", -1))
+                == _RobotModeInt.kWalking
+                and self._posture_is_upright()
+            ):
+                self.logger.info("Get-up finished; robot is in Walking mode")
+                return True
+        self.logger.error("Get-up did not finish within %.0fs",
+                          self.cfg.booster.getup_timeout_s)
+        return False
+
     def create_low_cmd_publisher(self, name):
         self.publish_node = rclpy.create_node(name)
         publisher = self.publish_node.create_publisher(
@@ -292,6 +338,17 @@ class BoosterRobotPortal:
         self.rpc_service_client = self.publish_node.create_client(
             RpcService, "booster_rpc_service"
         )
+        # Current FSM state for monitors (latched so late joiners get it).
+        self.fsm_state_publisher = self.publish_node.create_publisher(
+            String,
+            "booster_deploy/fsm_state",
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+            ),
+        )
 
         return publisher
 
@@ -312,7 +369,12 @@ class BoosterRobotPortal:
             request.msg.body = json.dumps(body) if body is not None else ""
 
             future = self.rpc_service_client.call_async(request)
-            rclpy.spin_until_future_complete(self.publish_node, future)
+            rclpy.spin_until_future_complete(
+                self.publish_node, future, timeout_sec=3.0)
+            if not future.done():
+                self.rpc_service_client.remove_pending_request(future)
+                self.logger.error("booster_rpc_service call timed out")
+                return False, None
             result = future.result()
         except Exception as exc:
             self.logger.error("booster_rpc_service call failed: %s", exc)
@@ -625,6 +687,12 @@ class BoosterRobotPortal:
                 f"mean_period={stats['mean_period_s']}, "
                 f"min={stats['min_period_s']}, max={stats['max_period_s']}"
             )
+        # Release the shared-memory segments explicitly: deploy.py exits
+        # with os._exit afterwards, which skips the atexit cleanup.
+        for arr in (self.synced_state, self.synced_command, self.synced_action):
+            arr.cleanup()
+        for metric in self.metrics.values():
+            metric._arr.cleanup()
 
     # ------------------------------------------------------------------ FSM
     def _posture_is_upright(self) -> bool:
@@ -726,7 +794,12 @@ class BoosterRobotPortal:
             ok = self._change_robot_mode("damping")
         elif target == IDLE:
             self._fsm_request(IDLE)
-            ok = self._change_robot_mode("walking")
+            if current == ESTOP and not self._posture_is_upright():
+                # A limp robot is usually on the floor: use the firmware's
+                # get-up, which ends in Walking mode.
+                ok = self._get_up()
+            else:
+                ok = self._change_robot_mode("walking")
         else:
             ok = self._fsm_request(target)
         if not ok:
@@ -776,6 +849,28 @@ class BoosterRobotPortal:
             self._fsm.switch(target)
             self._fsm_print_state()
 
+    def _fsm_check_robot_mode(self) -> None:
+        """Mode watchdog: the firmware can leave Custom mode on its own (a
+        fall protection, a restart, an operator app).  If it did while a
+        Custom state is active, stop publishing and follow the robot."""
+        from ..fsm import CUSTOM_STATES, ESTOP, IDLE
+        if self._fsm.current not in CUSTOM_STATES:
+            return
+        ok, status = self._call_booster_rpc(_LOC_API_GET_STATUS)
+        if not ok or status is None:
+            return
+        mode = int(status.get("current_mode", -1))
+        if mode == _RobotModeInt.kCustom:
+            return
+        target = ESTOP if mode == _RobotModeInt.kDamping else IDLE
+        self.logger.error(
+            "Robot left Custom mode (current_mode=%d) while in %s; "
+            "commands are being ignored. Switching to %s.",
+            mode, self._fsm.current, target)
+        self._fsm_request(target)
+        self._fsm.switch(target)
+        self._fsm_print_state()
+
     def _fsm_print_state(self) -> None:
         hints = []
         labels = (("x", "x/X"), ("a", "r/A"), ("y", "n/Y"), ("b", "b/B"))
@@ -785,6 +880,8 @@ class BoosterRobotPortal:
                 hints.append(f"{label}: {target}")
         print(f"[FSM] state: {self._fsm.current}   "
               f"({', '.join(hints)}; Ctrl+C: exit)")
+        if self.fsm_state_publisher is not None:
+            self.fsm_state_publisher.publish(String(data=self._fsm.current))
 
     def run(self):
         """Main loop: supervise the deployment state machine (10 Hz).
@@ -837,8 +934,12 @@ class BoosterRobotPortal:
         print(self.remoteControlService.get_fsm_operation_hint())
         self._fsm_print_state()
 
+        next_mode_check = time.perf_counter()
         while self.is_running and not self.exit_event.is_set():
             self._fsm_sync_from_executor()
+            if time.perf_counter() >= next_mode_check:
+                next_mode_check += self.cfg.booster.mode_check_period_s
+                self._fsm_check_robot_mode()
             press = self.remoteControlService.consume_press()
             if press is not None:
                 target = self._fsm_map_press(press)
@@ -848,6 +949,16 @@ class BoosterRobotPortal:
                         press, self._fsm.current)
                 else:
                     self.fsm_transition(target)
+            with self._fsm_topic_lock:
+                requested, self._fsm_topic_request = (
+                    self._fsm_topic_request, None)
+            if requested is not None:
+                if requested not in self._fsm.states:
+                    self.logger.warning(
+                        "Ignoring unknown state request %r", requested)
+                elif requested != self._fsm.current:
+                    self.logger.info("State %s requested over topic", requested)
+                    self.fsm_transition(requested)
             if (
                 self.inference_process is not None
                 and not self.inference_process.is_alive()
@@ -900,6 +1011,7 @@ class BoosterRobotController(BaseController):
     def __init__(self, cfg: ControllerCfg, portal: BoosterRobotPortal) -> None:
         super().__init__(cfg)
         self.portal = portal
+        self._torque_warn_time = -1.0
         # Walking preparation starts inference before A/r, but keeps velocity
         # commands masked until that trigger is received.
         self._velocity_commands_enabled = not (
@@ -957,6 +1069,27 @@ class BoosterRobotController(BaseController):
             self.portal.motor_cmd[i].kp = kp_val
             self.portal.motor_cmd[i].kd = kd_val
         self.portal.low_cmd_publisher.publish(self.portal.low_cmd)
+        self._check_torque_limits(dof_targets)
+
+    def _check_torque_limits(self, dof_targets: torch.Tensor) -> None:
+        """Warn (throttled) when the PD torque the firmware will compute
+        from this command exceeds the joint's effort limit."""
+        tau = (self.robot.joint_stiffness
+               * (dof_targets - self.robot.data.joint_pos)
+               - self.robot.joint_damping * self.robot.data.joint_vel)
+        ratio = tau.abs() / self.robot.effort_limit
+        if not bool((ratio > 1.0).any()):
+            return
+        now = time.perf_counter()
+        if now - self._torque_warn_time < 1.0:
+            return
+        self._torque_warn_time = now
+        i = int(torch.argmax(ratio))
+        self.portal.logger.warning(
+            "predicted torque exceeds limit on %d joint(s); worst %s: "
+            "%.1f > %.1f Nm",
+            int((ratio > 1.0).sum()), self.robot.cfg.joint_names[i],
+            float(tau[i].abs()), float(self.robot.effort_limit[i]))
 
     def stop(self):
         super().stop()

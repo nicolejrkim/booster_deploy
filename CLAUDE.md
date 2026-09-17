@@ -29,7 +29,11 @@ bookkeeping (joint order, gains, action scaling) lives in config objects.
   `FsmExecutor` that runs the active state's behaviour at 50 Hz.
 - `booster_deploy/simulator/` — `BoosterRobotSim`, a MuJoCo ROS 2 node that
   emulates the robot firmware interface (`/low_state`, `/joint_ctrl`,
-  `booster_rpc_service`) so the real-robot deploy path runs on a workstation.
+  `booster_rpc_service`, get-up as a teleport) so the real-robot deploy path
+  runs on a workstation; optional elastic band (`elastic_band` service).
+- `booster_deploy/monitor/` — `RobotMonitor`, a viewer for a running
+  deployment (`/low_state`, `/joint_ctrl`, `booster_deploy/fsm_state`) with an
+  FSM panel that requests transitions on `booster_deploy/fsm_request`.
 - `scripts/deploy.py` — entry point; `scripts/sim_robot.py` — simulated robot
   for software-in-the-loop; `scripts/export_rsl_rl_policy.py` — RSL-RL
   checkpoint -> TorchScript + ONNX (folds in the obs normalizer).
@@ -42,6 +46,7 @@ python scripts/deploy.py --list           # registered tasks
 python scripts/deploy.py --task <name> --mujoco   # sim2sim (needs booster_assets)
 python scripts/deploy.py --task <name>            # real robot (needs ROS 2)
 python scripts/sim_robot.py --robot k1 --viewer   # simulated robot for the line above
+python scripts/monitor.py --robot k1              # live monitor of a running deployment
 python scripts/export_rsl_rl_policy.py --checkpoint <model_N.pt> --output <prefix>
 flake8                                    # max-line-length 80, see .flake8
 ```

@@ -40,6 +40,14 @@ class BoosterRobotControllerCfg:
     # State entered when the task policy finishes (e.g. motion end):
     # "stand" or "walk".
     after_task: str = "stand"
+    # Booster get-up used for ESTOP -> IDLE when the robot is not upright:
+    # GetUpVersion (0 = V1 for K1/T1/T2, 1 = V2, K1 only) and how long to
+    # wait for the robot to be up and in Walking mode.
+    getup_version: int = 0
+    getup_timeout_s: float = 20.0
+    # How often the supervisor verifies (GetStatus RPC) that the robot is
+    # still in Custom mode while a Custom state is active.
+    mode_check_period_s: float = 1.0
 
 
 @configclass

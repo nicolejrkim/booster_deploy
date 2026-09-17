@@ -34,6 +34,16 @@ parser.add_argument("--mode-transition", type=float, default=1.0,
                          "built-in stand controller takes over")
 parser.add_argument("--log-states", type=str, default=None,
                     help="save time/qpos/qvel/ctrl/mode to this .npz")
+parser.add_argument("--band", action="store_true", default=False,
+                    help="start with the elastic band on: a slack rope that "
+                         "catches the trunk when it drops below the anchor "
+                         "height; toggle with the viewer key E or the "
+                         "elastic_band service")
+parser.add_argument("--band-height", type=float, default=None,
+                    help="rope anchor height in m (default: spawn height, so "
+                         "standing and walking are unaffected)")
+parser.add_argument("--band-stiffness", type=float, default=2000.0)
+parser.add_argument("--band-damping", type=float, default=100.0)
 args = parser.parse_args()
 
 
@@ -59,6 +69,10 @@ def main():
         initial_mode=args.initial_mode,
         mode_transition_s=args.mode_transition,
         log_states=args.log_states,
+        elastic_band=args.band,
+        band_height=args.band_height,
+        band_stiffness=args.band_stiffness,
+        band_damping=args.band_damping,
     )
     try:
         sim.run(viewer=args.viewer)

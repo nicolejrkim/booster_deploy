@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 
 sys.path.append(".")
@@ -67,6 +68,12 @@ def main():
         from booster_deploy.controllers.booster_robot_controller import BoosterRobotPortal
         with BoosterRobotPortal(task_cfg) as portal:
             portal.run()
+        # The portal has handed the robot back and joined its threads and
+        # processes.  Interpreter teardown of a forked ROS 2 / DDS process can
+        # occasionally hang; do not let that leave a zombie deployment behind.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":

@@ -132,14 +132,57 @@ python scripts/deploy.py --task k1_bm154_jamesbrown
 ```
 
 Then drive the state machine from terminal 2 exactly as on the robot (`x`,
-`r`, `n`, `b`). The simulated robot starts in Walking mode holding the prepare
-pose with the prepare gains;
+`r`, `n`, `b`), or from the monitor window (below). The simulated robot starts
+in Walking mode holding the prepare pose with the prepare gains;
 Damping mode only damps the joints; Custom mode applies the latest
 `/joint_ctrl` command, and commands received before the switch are retained
 as on the robot. Booster's built-in locomotion controller is not emulated, so
 Walking mode is a standing hold. Useful options: `--state-rate` (default
 500 Hz), `--physics-dt`, `--rtf` to slow the simulation down, and
 `--log-states <file>` to record `time/qpos/qvel/ctrl/mode` for offline checks.
+Get-up is not simulated: the get-up RPC puts the robot back upright in the
+prepare pose. The simulator also publishes ground-truth odometry on
+`/odometer_state` and the normal contact force under each foot on
+`booster_sim/contact_forces`, and warns (once per second) when a commanded
+PD torque exceeds a joint's limit before clamping it, as crl-humanoid-ros'
+simulator does. The deploy prints the same warning on the real robot from
+the torque the firmware will compute for each command.
+
+**Elastic band.** `--band` attaches a slack rope to the trunk: no force
+while the trunk is at or above the anchor height (the spawn height by
+default), and a spring-damper catch (`--band-stiffness`, `--band-damping`)
+when it drops below, so policies can be tried without falls while standing
+and walking are unaffected. Toggle it at runtime with `E` in the simulator
+window, `B` in the monitor, or the `elastic_band` service (`std_srvs/SetBool`).
+
+### Live monitor
+
+`scripts/monitor.py` watches a running deployment, real or simulated, from
+any machine on the same ROS 2 domain:
+
+```bash
+python scripts/monitor.py --robot k1            # viewer + status line
+python scripts/monitor.py --robot k1 --no-viewer  # status line only (SSH)
+python scripts/monitor.py --robot k1 --log run1   # also record the stream
+```
+
+It poses the model from `/low_state` (encoders and IMU, feet kept on the
+floor) and places it with `/odometer_state` (`booster_interface/Odometer`,
+published by the robot firmware and by the simulator; without it the robot
+stays at the origin and steps in place), draws a translucent ghost at the
+`/joint_ctrl` targets and a floating label with the FSM state, and prints the
+topic rates, the largest joint tracking error, the largest torque relative to
+the effort limit (flagged `TORQUE LIMIT` at 95 %), joints outside their angle
+range, the trunk tilt and, against the simulator, the foot contact forces.
+Keys in the monitor window:
+
+| Key | Action |
+|-----|--------|
+| `M` | show/hide the state-machine panel |
+| `Up`/`Down`, `Enter` | select a state in the panel and request the transition |
+| `B` | toggle the simulator's elastic band |
+| `N` | show/hide the status text |
+| `V` | camera follows the robot on/off |
 
 ### Run Sim2Real (Real Robots)
 
@@ -231,6 +274,21 @@ any --B--> ESTOP --Y--> IDLE                      Ctrl+C: exit_mode, then quit
   (`"stand"` by default, or `"walk"`).
 - `Ctrl+C` hands the robot back (`booster.exit_mode`: `"walking"` -> `IDLE`,
   `"damping"` -> `ESTOP`) and exits.
+- A mode watchdog polls `GetStatus` every `booster.mode_check_period_s`
+  (1 s) while a Custom state is active. If the firmware left Custom mode on
+  its own (fall protection, restart, the operator app; or a restarted
+  simulator), the deploy stops publishing and follows the robot to `IDLE` or
+  `ESTOP` instead of driving a ghost.
+- `ESTOP -> IDLE` on a robot that is not upright uses Booster's built-in
+  get-up (`GetUpWithMode`, `booster.getup_version` 0 = V1, 1 = V2 on K1) and
+  waits until the robot reports Walking mode.
+- Transitions can also be requested by name on the `booster_deploy/fsm_request`
+  topic (`std_msgs/String`, used by the monitor), and the current state is
+  published latched on `booster_deploy/fsm_state`:
+
+  ```bash
+  ros2 topic pub --once /booster_deploy/fsm_request std_msgs/msg/String "{data: STAND}"
+  ```
 
 The same flow can be exercised without hardware with the simulated robot
 (see below).

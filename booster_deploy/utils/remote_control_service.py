@@ -1,5 +1,6 @@
 from typing import Optional
 import evdev
+import os
 import threading
 from dataclasses import dataclass
 import time
@@ -144,16 +145,21 @@ class RemoteControlService:
             tty.setcbreak(fd)
             while self._running:
                 # small timeout to allow clean shutdown
-                rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
-                if rlist:
-                    ch = sys.stdin.read(1)
+                rlist, _, _ = select.select([fd], [], [], 0.1)
+                if not rlist:
+                    continue
+                # Read everything that is pending, unbuffered: a buffered
+                # read(1) would leave quickly typed keys stuck in the
+                # stream buffer until the next keypress.
+                try:
+                    data = os.read(fd, 64).decode(errors="ignore")
+                except OSError:
+                    continue
+                for ch in data:
                     if ch == "\x03":  # Ctrl-C
                         # Let the main program handle KeyboardInterrupt
                         continue
-                    if ch == " ":
-                        key = "space"
-                    else:
-                        key = ch
+                    key = "space" if ch == " " else ch
                     try:
                         self._handle_keyboard_press(key)
                     except Exception:
