@@ -24,6 +24,8 @@ class JoystickConfig:
     # logitech
     custom_mode_button: evdev.ecodes = evdev.ecodes.BTN_X
     rl_gait_button: evdev.ecodes = evdev.ecodes.BTN_A
+    back_button: evdev.ecodes = evdev.ecodes.BTN_Y
+    estop_button: evdev.ecodes = evdev.ecodes.BTN_B
     x_axis: evdev.ecodes = evdev.ecodes.ABS_Y
     y_axis: evdev.ecodes = evdev.ecodes.ABS_X
     yaw_axis: evdev.ecodes = evdev.ecodes.ABS_Z
@@ -35,6 +37,10 @@ class JoystickConfig:
 
 
 class RemoteControlService:
+    # Logical buttons: X (custom / STAND), A (RL / forward), Y (back), B (ESTOP)
+    BUTTONS = ("x", "a", "y", "b")
+    # Keyboard keys mapped to the logical buttons.
+    KEYBOARD_BUTTONS = {"x": "x", "r": "a", "n": "y", "b": "b"}
     """Service for handling joystick remote control input without display dependencies."""
 
     def __init__(self, config: Optional[JoystickConfig] = None):
@@ -54,6 +60,12 @@ class RemoteControlService:
         self.ros_runner = None
         self._topic_custom_mode = False
         self._topic_rl_gait = False
+        # Latched presses by logical button name (x, a, y, b) from the
+        # keyboard and the remote-controller topic; joystick presses are
+        # edge-detected in consume_press().
+        self._latched: dict[str, bool] = {n: False for n in self.BUTTONS}
+        self._joystick_was_down = {n: False for n in self.BUTTONS}
+        self._topic_was_down = {n: False for n in self.BUTTONS}
 
         self._init_keyboard_control()
         self._start_keyboard_thread()
@@ -81,6 +93,13 @@ class RemoteControlService:
         if self.ros_node is not None:
             return "Press remote controller button X or keyboard 'x' to start custom mode."
         return "Press keyboard 'x' to start custom mode."
+
+    def get_fsm_operation_hint(self) -> str:
+        if self.joystick is not None:
+            return ("Remote: X=STAND, A=forward (WALK/TASK), Y=back, "
+                    "B=ESTOP; keyboard: x, r, n, b. Ctrl+C exits.")
+        return ("Keyboard: x=STAND, r=forward (WALK/TASK), n=back, b=ESTOP "
+                "(remote X/A/Y/B on the topic). Ctrl+C exits.")
 
     def get_rl_gait_operation_hint(self) -> str:
         # Keep the mode-switch prompt consistent across joystick, ROS topic,
@@ -155,6 +174,8 @@ class RemoteControlService:
                 self.keyboard_start_custom_mode = True
             if key == "r":
                 self.keyboard_start_rl_gait = True
+            if key in self.KEYBOARD_BUTTONS:
+                self._latched[self.KEYBOARD_BUTTONS[key]] = True
             if key == "w":
                 old_x = self.vx
                 self.vx = min(self.vx + 0.1, self.config.max_vx)
@@ -216,10 +237,17 @@ class RemoteControlService:
                 # Button messages can be followed by an axis update before the
                 # controller's 10 Hz polling loop runs. Latch the press until
                 # it is consumed so short X/A presses are not missed.
-                if getattr(msg, "x", False):
-                    self._topic_custom_mode = True
-                if getattr(msg, "a", False):
-                    self._topic_rl_gait = True
+                # The topic repeats the button state while held: latch
+                # only on the press edge so one press is one event.
+                for name in self.BUTTONS:
+                    down = bool(getattr(msg, name, False))
+                    if down and not self._topic_was_down[name]:
+                        self._latched[name] = True
+                        if name == "x":
+                            self._topic_custom_mode = True
+                        elif name == "a":
+                            self._topic_rl_gait = True
+                    self._topic_was_down[name] = down
 
         self.ros_node.create_subscription(
             RemoteControllerState,
@@ -289,6 +317,33 @@ class RemoteControlService:
         self.joystick_runner = threading.Thread(target=self._run_joystick)
         self.joystick_runner.daemon = True
         self.joystick_runner.start()
+
+    def _joystick_button(self, name: str):
+        return {
+            "x": self.config.custom_mode_button,
+            "a": self.config.rl_gait_button,
+            "y": self.config.back_button,
+            "b": self.config.estop_button,
+        }[name]
+
+    def consume_press(self) -> Optional[str]:
+        """Return one pending logical button press (x, a, y, b) or None.
+
+        Keyboard and topic presses are latched until consumed; joystick
+        buttons trigger once per press (edge-detected while polling).
+        """
+        active = set()
+        if self.joystick is not None:
+            active = set(self.joystick.active_keys())
+        with self._lock:
+            for name in self.BUTTONS:
+                down = self._joystick_button(name) in active
+                edge = down and not self._joystick_was_down[name]
+                self._joystick_was_down[name] = down
+                if edge or self._latched[name]:
+                    self._latched[name] = False
+                    return name
+        return None
 
     def start_custom_mode(self) -> bool:
         """Check if custom mode button is pressed."""

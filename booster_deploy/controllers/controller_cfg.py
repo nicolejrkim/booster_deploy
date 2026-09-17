@@ -34,6 +34,12 @@ class BoosterRobotControllerCfg:
     metrics_max_events: int = 2000
     # Mode to enter after Custom control exits. Supported values: "walking", "damping".
     exit_mode: str = "walking"
+    # Seconds to interpolate from the current pose to the prepare pose when
+    # entering the STAND state.
+    stand_transition_s: float = 1.0
+    # State entered when the task policy finishes (e.g. motion end):
+    # "stand" or "walk".
+    after_task: str = "stand"
 
 
 @configclass

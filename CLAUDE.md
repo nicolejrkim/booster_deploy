@@ -24,6 +24,9 @@ bookkeeping (joint order, gains, action scaling) lives in config objects.
   - `locomotion/` — velocity-command walking (K1/T1/T2).
   - `beyond_mimic/` — BeyondMimic motion tracking (anchor-orientation obs).
   - `bm154/` — BeyondMimic with the BM154 hardware-style obs (K1 dances).
+- `booster_deploy/fsm/` — deployment state machine (IDLE, STAND, WALK, TASK,
+  ESTOP): `StateMachine` + transition table, and the child-process
+  `FsmExecutor` that runs the active state's behaviour at 50 Hz.
 - `booster_deploy/simulator/` — `BoosterRobotSim`, a MuJoCo ROS 2 node that
   emulates the robot firmware interface (`/low_state`, `/joint_ctrl`,
   `booster_rpc_service`) so the real-robot deploy path runs on a workstation.
@@ -75,9 +78,12 @@ side effect of import; a new task only needs its package and a
   is malformed; drop it from the CMakeLists). On this workstation the
   workspace is `~/stmr/booster_ros2_ws`; `.venv` (conda-based Python 3.10)
   can import Humble's `rclpy` once both setup scripts are sourced.
-- Real-robot flow: `X` enters Custom mode and runs the robot's locomotion
-  policy with zero commands (`prepare_mode="walking"`), `A`/`r` starts the
-  selected task; `exit_mode` picks the mode after the controller exits.
+- Real-robot flow is the FSM: X/`x` IDLE->STAND (posture check, primed hold,
+  Custom RPC), A/`r` forward (STAND->WALK->TASK; `prepare_mode="standing"`
+  skips WALK), Y/`n` back, B/`b` ESTOP (Damping RPC). The portal (main
+  process) validates transitions and does RPCs; the executor child
+  acknowledges via `fsm_active` and may request ESTOP (policy `stop()`) or
+  `after_task` (policy `finish()`). Ctrl+C hands back per `exit_mode`.
 
 ## BM154 (tasks/bm154)
 

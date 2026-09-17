@@ -160,7 +160,7 @@ class BeyondMimicPolicy(Policy):
             self.cfg.stop_at_motion_end
             and self.current_frame >= self.motion.time_step_total
         ):
-            self.controller.stop()
+            self.controller.finish()
 
         if action is None:
             raise RuntimeError("Underlying model returned None from inference")

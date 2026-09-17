@@ -64,6 +64,14 @@ class BoosterRobotPortal:
         self.velocity_commands_enabled_event = mp.Event()
         self.task_start_event = mp.Event()
         self.low_state_received_event = threading.Event()
+        # Deployment state machine (see booster_deploy.fsm): the portal
+        # requests states, the executor process acknowledges the active one
+        # and may request follow-up states itself (policy stop/finish).
+        self.fsm_requested = mp.Value("i", 0)
+        self.fsm_active = mp.Value("i", 0)
+        self.fsm_executor_request = mp.Value("i", -1)
+        self._fsm = None
+        self._fsm_walk_first = False
         self.is_running = True
         def signal_handler(sig, frame):
             if mp.current_process().name == "MainProcess":
@@ -618,8 +626,175 @@ class BoosterRobotPortal:
                 f"min={stats['min_period_s']}, max={stats['max_period_s']}"
             )
 
+    # ------------------------------------------------------------------ FSM
+    def _posture_is_upright(self) -> bool:
+        state = self.synced_state.read()[0]
+        rpy = torch.from_numpy(state["root_rpy_w"]).to(dtype=torch.float32)
+        projected_gravity = lab_math.quat_apply_inverse(
+            lab_math.quat_from_euler_xyz(*rpy).squeeze(),
+            torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32),
+        )
+        if projected_gravity[2] > -0.5:
+            self.logger.error(
+                "Robot posture is unsafe (projected_gravity[2]=%.3f)",
+                float(projected_gravity[2]),
+            )
+            return False
+        return True
+
+    def _enter_custom_mode(self) -> str:
+        """Prime a PD hold of the current pose and switch to Custom mode.
+
+        Returns ``"ok"``, ``"unsafe"`` (posture check failed) or ``"failed"``.
+        """
+        if not self._posture_is_upright():
+            return "unsafe"
+        while (rclpy.ok()
+               and self.low_cmd_publisher.get_subscription_count() == 0):
+            if self.exit_event.is_set():
+                return "failed"
+            self.logger.info(
+                "Waiting for '/joint_ctrl' subscriber, retry in 0.5s")
+            time.sleep(0.5)
+        # Send exactly one hold command while the built-in controller still
+        # owns the robot; the low-level controller retains it across the
+        # Custom transition until the executor publishes.
+        self._prime_custom_command()
+        time.sleep(0.1)
+        if not self._change_robot_mode("custom"):
+            return "failed"
+        return "ok"
+
+    def _build_walk_cfg(self):
+        """Locomotion config for the WALK state, or None if the task is it."""
+        try:
+            walk_cfg = self._build_prepare_cfg()
+        except RuntimeError as exc:
+            self.logger.warning("No WALK state: %s", exc)
+            return None
+        if (walk_cfg.policy.checkpoint_path
+                == self.cfg.policy.checkpoint_path):
+            return None
+        return walk_cfg
+
+    def _fsm_request(self, target: str, wait_ack: bool = True,
+                     timeout_s: float = 3.0) -> bool:
+        from ..fsm import state_index
+        index = state_index(target)
+        self.fsm_requested.value = index
+        if not wait_ack:
+            return True
+        deadline = time.perf_counter() + timeout_s
+        while time.perf_counter() < deadline:
+            if self.fsm_active.value == index:
+                return True
+            if self.exit_event.is_set():
+                return False
+            time.sleep(0.01)
+        self.logger.error(
+            "Executor did not enter %s within %.1fs", target, timeout_s)
+        return False
+
+    def fsm_transition(self, target: str) -> bool:
+        """Perform a validated state transition (mode RPCs + executor)."""
+        from ..fsm import ESTOP, IDLE, STAND
+        fsm = self._fsm
+        if not fsm.can(target):
+            self.logger.warning(
+                "Transition %s -> %s is not allowed (allowed: %s)",
+                fsm.current, target, ", ".join(fsm.targets()) or "none")
+            return False
+        current = fsm.current
+        ok = True
+        if current == IDLE and target == STAND:
+            status = self._enter_custom_mode()
+            if status == "unsafe":
+                self.logger.error("Refusing STAND; switching to Damping mode")
+                self._safety_abort = True
+                self._fsm_request(ESTOP, wait_ack=False)
+                self._change_robot_mode("damping")
+                fsm.switch(ESTOP)
+                self._fsm_print_state()
+                return False
+            ok = status == "ok" and self._fsm_request(STAND)
+            if not ok:
+                self._change_robot_mode("walking")
+        elif target == ESTOP:
+            # The executor publishes one damping command and stops publishing
+            # before the firmware leaves Custom mode.
+            self._fsm_request(ESTOP)
+            ok = self._change_robot_mode("damping")
+        elif target == IDLE:
+            self._fsm_request(IDLE)
+            ok = self._change_robot_mode("walking")
+        else:
+            ok = self._fsm_request(target)
+        if not ok:
+            self.logger.error("Transition %s -> %s failed", current, target)
+            return False
+        fsm.switch(target)
+        self._fsm_print_state()
+        return True
+
+    def _fsm_map_press(self, press: str):
+        """Map a logical button (x, a, y, b) to a target state, or None."""
+        from ..fsm import ESTOP, IDLE, STAND, TASK, WALK
+        current = self._fsm.current
+        if press == "x":
+            return STAND if current == IDLE else None
+        if press == "b":
+            return ESTOP if current != ESTOP else None
+        if press == "a":  # forward
+            if current == STAND:
+                return WALK if self._fsm_walk_first else TASK
+            if current == WALK:
+                return TASK
+            return None
+        if press == "y":  # back
+            if current == TASK:
+                return WALK if self._fsm_walk_first else STAND
+            if current == WALK:
+                return STAND
+            if current in (STAND, ESTOP):
+                return IDLE
+        return None
+
+    def _fsm_sync_from_executor(self) -> None:
+        """Apply a transition initiated by the executor (policy stop/finish)."""
+        from ..fsm import ESTOP, state_name
+        index = self.fsm_executor_request.value
+        if index < 0:
+            return
+        self.fsm_executor_request.value = -1
+        target = state_name(index)
+        self.logger.info("Executor switched to %s", target)
+        self.fsm_requested.value = index
+        if target == ESTOP:
+            self._safety_abort = True
+            self._change_robot_mode("damping")
+        if self._fsm.current != target:
+            self._fsm.switch(target)
+            self._fsm_print_state()
+
+    def _fsm_print_state(self) -> None:
+        hints = []
+        labels = (("x", "x/X"), ("a", "r/A"), ("y", "n/Y"), ("b", "b/B"))
+        for press, label in labels:
+            target = self._fsm_map_press(press)
+            if target is not None:
+                hints.append(f"{label}: {target}")
+        print(f"[FSM] state: {self._fsm.current}   "
+              f"({', '.join(hints)}; Ctrl+C: exit)")
+
     def run(self):
-        """Main loop: monitor inference process and diagnostics (10Hz)."""
+        """Main loop: supervise the deployment state machine (10 Hz).
+
+        States and transitions are described in ``booster_deploy.fsm``.
+        """
+        from ..fsm import (
+            CUSTOM_STATES, ESTOP, IDLE, STATES, TRANSITIONS, StateMachine,
+        )
+        from ..fsm.executor import fsm_process_func
 
         print("Initialization complete.")
 
@@ -629,55 +804,75 @@ class BoosterRobotPortal:
                 f"Unsupported prepare_mode {self.cfg.robot.prepare_mode!r}; "
                 "expected 'walking' or 'standing'"
             )
+        exit_mode = self.cfg.booster.exit_mode.strip().lower()
+        exit_mode = "walking" if exit_mode == "walk" else exit_mode
+        if exit_mode not in ("walking", "damping"):
+            raise ValueError(
+                f"Unsupported exit_mode {self.cfg.booster.exit_mode!r}; "
+                "expected 'walking' or 'damping'"
+            )
 
-        # Walking preparation starts the Python locomotion policy immediately
-        # with zero commands; A/r then unlocks its velocity input.  Other
-        # policies, and standing preparation, wait for A/r before inference.
-        if not self.start_custom_mode_conditionally():
-            print("Custom mode initialization cancelled.")
-        elif not self.start_rl_gait_conditionally(
-            wait_for_trigger=prepare_mode == "standing"
+        while (
+            rclpy.ok()
+            and not self.exit_event.is_set()
+            and not self.low_state_received_event.wait(timeout=0.5)
         ):
-            print("RL mode initialization cancelled.")
-        else:
-            if prepare_mode == "walking":
-                print(f"{self.remoteControlService.get_rl_gait_operation_hint()}")
-            # main loop: wait for exit signal
-            while self.is_running and not self.exit_event.is_set():
-                if (
-                    prepare_mode == "walking"
-                    and not self.task_start_event.is_set()
-                    and self.remoteControlService.start_rl_gait()
-                ):
-                    self.task_start_event.set()
-                    self.velocity_commands_enabled_event.set()
-                    self.logger.info("Task policy enabled after A trigger")
-                    if self.cfg.vel_command is not None:
-                        print(f"{self.remoteControlService.get_operation_hint()}")
-                # check whether the inference process is alive
-                if self.inference_process is not None:
-                    inference_process_alive = self.inference_process.is_alive()
-                    if not inference_process_alive:
-                        self.logger.error("Inference process died unexpectedly")
-                        self.is_running = False
-                        self.exit_event.set()
-                        break
-                time.sleep(0.1)
+            self.logger.info("Waiting for first '/low_state' message")
+        if not self.low_state_received_event.is_set():
+            self.logger.error("No valid '/low_state'; not starting")
+            return
 
-        exit_mode = "damping" if self._safety_abort else self.cfg.booster.exit_mode.strip().lower()
-        exit_mode_display = "Walking" if exit_mode == "walk" else exit_mode.capitalize()
-        self.logger.info(
-            "Custom mode ended; explicitly switching to %s mode...",
-            exit_mode_display,
+        walk_cfg = self._build_walk_cfg()
+        self._fsm = StateMachine(STATES, TRANSITIONS, IDLE)
+        self._fsm_walk_first = (
+            prepare_mode == "walking" and walk_cfg is not None)
+
+        self.inference_process = mp.Process(
+            target=fsm_process_func,
+            args=(self, self.cfg, walk_cfg),
+            daemon=True,
         )
-        try:
-            if not self._change_robot_mode(exit_mode):
-                self.logger.error(
-                    "Custom mode ended, but switching to %s mode failed",
-                    exit_mode_display,
-                )
-        except ValueError as exc:
-            self.logger.error("Custom mode exit configuration is invalid: %s", exc)
+        self.inference_process.start()
+        self.logger.info("FSM executor process started")
+        print(self.remoteControlService.get_fsm_operation_hint())
+        self._fsm_print_state()
+
+        while self.is_running and not self.exit_event.is_set():
+            self._fsm_sync_from_executor()
+            press = self.remoteControlService.consume_press()
+            if press is not None:
+                target = self._fsm_map_press(press)
+                if target is None:
+                    self.logger.warning(
+                        "Button '%s' has no effect in %s",
+                        press, self._fsm.current)
+                else:
+                    self.fsm_transition(target)
+            if (
+                self.inference_process is not None
+                and not self.inference_process.is_alive()
+            ):
+                self.logger.error("FSM executor process died unexpectedly")
+                self.is_running = False
+                self.exit_event.set()
+                break
+            time.sleep(0.1)
+
+        # Hand the robot back before exiting.  The executor has stopped
+        # publishing (exit_event), so only the firmware mode is switched.
+        self.exit_event.set()
+        if self.inference_process is not None:
+            self.inference_process.join(timeout=2.0)
+        current = self._fsm.current
+        if current in CUSTOM_STATES:
+            damping = self._safety_abort or exit_mode == "damping"
+            target_mode = "damping" if damping else "walking"
+            self.logger.info("Exiting from %s; switching to %s mode...",
+                             current, target_mode.capitalize())
+            if not self._change_robot_mode(target_mode):
+                self.logger.error("Switching to %s mode failed",
+                                  target_mode.capitalize())
+            self._fsm.switch(ESTOP if target_mode == "damping" else IDLE)
 
     def __enter__(self) -> BoosterRobotPortal:
         return self

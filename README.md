@@ -131,8 +131,9 @@ source <booster_ros2_ws>/install/setup.bash
 python scripts/deploy.py --task k1_bm154_jamesbrown
 ```
 
-Then press `x` and `r` in terminal 2 exactly as on the robot. The simulated
-robot starts in Walking mode holding the prepare pose with the prepare gains;
+Then drive the state machine from terminal 2 exactly as on the robot (`x`,
+`r`, `n`, `b`). The simulated robot starts in Walking mode holding the prepare
+pose with the prepare gains;
 Damping mode only damps the joints; Custom mode applies the latest
 `/joint_ctrl` command, and commands received before the switch are retained
 as on the robot. Booster's built-in locomotion controller is not emulated, so
@@ -199,26 +200,40 @@ python3 scripts/deploy.py --task <TASK_NAME> --exit-mode damping
 The value `"walk"` is also accepted as an alias for `"walking"` in Python configuration.
 
 
-#### Robot preparation mode
+#### Deployment state machine
 
-`robot.prepare_mode` controls what happens after pressing `X` to enter Custom
-mode. Set it independently in each robot configuration (T1, T2, or K1):
+On the real robot, `deploy.py` runs a finite state machine
+(`booster_deploy/fsm`). Only the listed transitions are accepted; anything
+else is refused and logged. The current state and the buttons that act on it
+are printed at every change.
 
-- `"walking"` (default): read the current joint positions from `/low_state`,
-  publish one position-hold command using the robot's `prepare_state` `kp/kd`,
-  switch to Custom, then start the matching robot locomotion policy with all
-  velocity commands masked to zero. Press `A` on the remote (or `r` on the
-  keyboard) to stop the preparation policy and start the task selected by
-  `--task`.
-- `"standing"`: publish the current-position hold command, switch to Custom,
-  and interpolate for approximately one second to the configured
-  `prepare_state.joint_pos`. Press `A`/`r` to start the selected task policy.
+| State | Robot mode | What runs |
+|-------|------------|-----------|
+| `IDLE` | Walking (Booster's own controller) | nothing published; start state |
+| `STAND` | Custom | PD hold of `robot.prepare_state` (1 s interpolation on entry) |
+| `WALK` | Custom | the robot's locomotion policy with stick commands |
+| `TASK` | Custom | the policy selected with `--task` |
+| `ESTOP` | Damping | robot goes limp; nothing published |
 
-The mode can be set in a robot configuration, for example:
-
-```python
-robot = T2_31DOF_CFG.replace(prepare_mode="walking")
+```text
+IDLE --X--> STAND --A--> WALK --A--> TASK        Y steps back one state
+any --B--> ESTOP --Y--> IDLE                      Ctrl+C: exit_mode, then quit
 ```
+
+- `robot.prepare_mode` decides where `A` goes from `STAND`: `"walking"`
+  (default) inserts the `WALK` state (`STAND -> WALK -> TASK`), `"standing"`
+  goes straight to `TASK`.
+- Entering `STAND` from `IDLE` checks the posture, primes a hold of the
+  current pose with the `prepare_state` gains and switches the firmware to
+  Custom mode. An unsafe posture switches to Damping instead (`ESTOP`).
+- A policy's safety fallback moves to `ESTOP`; a policy that finishes (for
+  example a motion with `stop_at_motion_end`) moves to `booster.after_task`
+  (`"stand"` by default, or `"walk"`).
+- `Ctrl+C` hands the robot back (`booster.exit_mode`: `"walking"` -> `IDLE`,
+  `"damping"` -> `ESTOP`) and exits.
+
+The same flow can be exercised without hardware with the simulated robot
+(see below).
 
 ### Remote Controller
 
@@ -240,15 +255,17 @@ The deployment supports both remote controllers and keyboard input:
 </table>
 
 On either remote controller, use the left stick for forward/lateral motion, the
-right stick for rotation, `X` to start Custom mode, and `A` to start RL mode.
+right stick for rotation, and the face buttons to drive the state machine.
 
 | Control | Action |
 |---------|--------|
 | Left stick forward/back | Increase/decrease forward velocity (`vx`) |
 | Left stick left/right | Increase/decrease lateral velocity (`vy`) |
 | Right stick left/right | Rotate left/right (`vyaw`) |
-| Joystick `X` | Start Custom mode |
-| Joystick `A` | Start RL mode |
+| Joystick `X` | `IDLE -> STAND` |
+| Joystick `A` | forward: `STAND -> WALK -> TASK` |
+| Joystick `Y` | back one state (`ESTOP -> IDLE`) |
+| Joystick `B` | `ESTOP` |
 
 Keyboard:
 
@@ -257,14 +274,14 @@ Keyboard:
 | `w` / `s` | Increase/decrease `vx` by `0.1` |
 | `a` / `d` | Increase/decrease `vy` by `0.1` |
 | `q` / `e` | Increase/decrease `vyaw` by `0.1` |
-| `x` | Start Custom mode |
-| `r` | Start RL mode |
+| `x` | `IDLE -> STAND` |
+| `r` | forward: `STAND -> WALK -> TASK` |
+| `n` | back one state (`ESTOP -> IDLE`) |
+| `b` | `ESTOP` |
 | `Space` | Set all velocity commands to zero |
 
-With `prepare_mode="walking"`, `X` starts zero-command locomotion preparation and
-`A`/`r` starts the selected task policy. With `prepare_mode="standing"`, `X`
-first performs the one-second transition to `prepare_state.joint_pos`, and
-`A`/`r` then starts the selected task policy. Stop the deployment with `Ctrl+C`.
+Stop the deployment with `Ctrl+C`; the robot is handed back to the mode
+selected by `booster.exit_mode`.
 
 
 ## Repository Layout

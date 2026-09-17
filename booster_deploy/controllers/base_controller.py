@@ -227,6 +227,14 @@ class BaseController:
         """Stop and clean up the deployment session."""
         self.is_running = False
 
+    def finish(self) -> None:
+        """Called by a policy that completed its task normally.
+
+        Defaults to :meth:`stop`; state-machine deployments override it to
+        hand over to the follow-up state instead of stopping.
+        """
+        self.stop()
+
     @abstractmethod
     def ctrl_step(self, dof_targets: torch.Tensor) -> None:
         """Advance the environment by one control step.
