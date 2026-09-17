@@ -45,6 +45,7 @@ source .venv/bin/activate                 # see README for venv setup
 python scripts/deploy.py --list           # registered tasks
 python scripts/deploy.py --task <name> --mujoco   # sim2sim (needs booster_assets)
 python scripts/deploy.py --task <name>            # real robot (needs ROS 2)
+python scripts/deploy.py --task <name> --sim      # same path against a simulated robot it starts itself
 python scripts/sim_robot.py --robot k1 --viewer   # simulated robot for the line above
 python scripts/monitor.py --robot k1              # live monitor of a running deployment
 python scripts/export_rsl_rl_policy.py --checkpoint <model_N.pt> --output <prefix>

@@ -131,6 +131,14 @@ source <booster_ros2_ws>/install/setup.bash
 python scripts/deploy.py --task k1_bm154_jamesbrown
 ```
 
+Or in one terminal, letting the deploy start and stop the simulated robot
+itself (`--sim-args=` passes options through; the `=` form is needed because
+the values start with dashes):
+
+```bash
+python scripts/deploy.py --task k1_bm154_jamesbrown --sim --sim-args="--band"
+```
+
 Then drive the state machine from terminal 2 exactly as on the robot (`x`,
 `r`, `n`, `b`), or from the monitor window (below). The simulated robot starts
 in Walking mode holding the prepare pose with the prepare gains;
