@@ -253,7 +253,17 @@ class RemoteControlService:
                     abs_info = caps.get(evdev.ecodes.EV_ABS, [])
                     # Look for typical gamepad axes
                     axes = [code for (code, info) in abs_info]
-                    if all(code in axes for code in [self.config.x_axis, self.config.y_axis, self.config.yaw_axis]):
+                    keys = caps.get(evdev.ecodes.EV_KEY, [])
+                    # Require the gamepad buttons too: some non-gamepad
+                    # devices (e.g. motherboard LED controllers) advertise
+                    # joystick axes without any buttons.
+                    has_axes = all(code in axes for code in [
+                        self.config.x_axis, self.config.y_axis,
+                        self.config.yaw_axis])
+                    has_buttons = all(code in keys for code in [
+                        self.config.custom_mode_button,
+                        self.config.rl_gait_button])
+                    if has_axes and has_buttons:
                         absinfo = {}
                         for code, info in abs_info:
                             absinfo[code] = info

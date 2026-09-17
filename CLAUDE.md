@@ -24,8 +24,12 @@ bookkeeping (joint order, gains, action scaling) lives in config objects.
   - `locomotion/` — velocity-command walking (K1/T1/T2).
   - `beyond_mimic/` — BeyondMimic motion tracking (anchor-orientation obs).
   - `bm154/` — BeyondMimic with the BM154 hardware-style obs (K1 dances).
-- `scripts/deploy.py` — entry point; `scripts/export_rsl_rl_policy.py` —
-  RSL-RL checkpoint -> TorchScript + ONNX (folds in the obs normalizer).
+- `booster_deploy/simulator/` — `BoosterRobotSim`, a MuJoCo ROS 2 node that
+  emulates the robot firmware interface (`/low_state`, `/joint_ctrl`,
+  `booster_rpc_service`) so the real-robot deploy path runs on a workstation.
+- `scripts/deploy.py` — entry point; `scripts/sim_robot.py` — simulated robot
+  for software-in-the-loop; `scripts/export_rsl_rl_policy.py` — RSL-RL
+  checkpoint -> TorchScript + ONNX (folds in the obs normalizer).
 
 ## Commands
 
@@ -34,6 +38,7 @@ source .venv/bin/activate                 # see README for venv setup
 python scripts/deploy.py --list           # registered tasks
 python scripts/deploy.py --task <name> --mujoco   # sim2sim (needs booster_assets)
 python scripts/deploy.py --task <name>            # real robot (needs ROS 2)
+python scripts/sim_robot.py --robot k1 --viewer   # simulated robot for the line above
 python scripts/export_rsl_rl_policy.py --checkpoint <model_N.pt> --output <prefix>
 flake8                                    # max-line-length 80, see .flake8
 ```
@@ -65,6 +70,11 @@ side effect of import; a new task only needs its package and a
   `.gitignore`.
 - **Policy rate** is `ControllerCfg.policy_dt` (0.02 s = 50 Hz by default);
   MuJoCo runs `policy_dt / mujoco.decimation` physics steps per policy step.
+- **Software-in-the-loop** needs ROS 2 Humble plus `booster_interface` from
+  Booster's `booster_robotics_sdk_ros2` built with colcon (its `Subtitle.msg`
+  is malformed; drop it from the CMakeLists). On this workstation the
+  workspace is `~/stmr/booster_ros2_ws`; `.venv` (conda-based Python 3.10)
+  can import Humble's `rclpy` once both setup scripts are sourced.
 - Real-robot flow: `X` enters Custom mode and runs the robot's locomotion
   policy with zero commands (`prepare_mode="walking"`), `A`/`r` starts the
   selected task; `exit_mode` picks the mode after the controller exits.

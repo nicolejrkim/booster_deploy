@@ -104,6 +104,42 @@ Copy the matching motion `.npz` into `tasks/bm154/robots/k1/motions/` and add a
    python scripts/deploy.py --task <TASK_NAME> --mujoco
    ```
 
+### Software-in-the-loop: the real-robot path against a simulated robot
+
+`scripts/sim_robot.py` runs a MuJoCo robot that speaks the robot firmware's
+ROS 2 interface: it publishes `/low_state`, consumes `/joint_ctrl` and serves
+`booster_rpc_service` for the `ChangeMode`/`GetStatus` calls. With it, the
+exact code path used on the real robot (DDS topics, Custom-mode switch,
+prepare stage, remote-control handling, inference process, exit mode) runs
+unchanged on a workstation.
+
+Prerequisites: ROS 2 Humble and the `booster_interface` message package from
+[booster_robotics_sdk_ros2](https://github.com/BoosterRobotics/booster_robotics_sdk_ros2)
+built in a colcon workspace (drop `msg/Subtitle.msg` from its `CMakeLists.txt`;
+it is not a valid ROS message). Both `rclpy` and `booster_interface` must be
+importable from the Python environment that runs the scripts.
+
+```bash
+# terminal 1: simulated robot
+source /opt/ros/humble/setup.bash
+source <booster_ros2_ws>/install/setup.bash
+python scripts/sim_robot.py --robot k1 --viewer
+
+# terminal 2: the real-robot entry point, no --mujoco
+source /opt/ros/humble/setup.bash
+source <booster_ros2_ws>/install/setup.bash
+python scripts/deploy.py --task k1_bm154_jamesbrown
+```
+
+Then press `x` and `r` in terminal 2 exactly as on the robot. The simulated
+robot starts in Walking mode holding the prepare pose with the prepare gains;
+Damping mode only damps the joints; Custom mode applies the latest
+`/joint_ctrl` command, and commands received before the switch are retained
+as on the robot. Booster's built-in locomotion controller is not emulated, so
+Walking mode is a standing hold. Useful options: `--state-rate` (default
+500 Hz), `--physics-dt`, `--rtf` to slow the simulation down, and
+`--log-states <file>` to record `time/qpos/qvel/ctrl/mode` for offline checks.
+
 ### Run Sim2Real (Real Robots)
 
 **IMPORTANT**: Make sure to install [Booster Firmware](https://booster.feishu.cn/wiki/E3q5wF5SnitXZgkY18Uc8odBnXb) >= v1.4 on the robot before proceeding.
