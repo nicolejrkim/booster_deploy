@@ -34,6 +34,8 @@ bookkeeping (joint order, gains, action scaling) lives in config objects.
 - `booster_deploy/monitor/` — `RobotMonitor`, a viewer for a running
   deployment (`/low_state`, `/joint_ctrl`, `booster_deploy/fsm_state`) with an
   FSM panel that requests transitions on `booster_deploy/fsm_request`.
+- `scripts/booster_train_pipeline.py` — hand-off with Booster's `booster_train`
+  (CSV -> motion + task package; trained run -> exported policy + deploy task).
 - `scripts/deploy.py` — entry point; `scripts/sim_robot.py` — simulated robot
   for software-in-the-loop; `scripts/export_rsl_rl_policy.py` — RSL-RL
   checkpoint -> TorchScript + ONNX (folds in the obs normalizer).

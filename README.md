@@ -88,6 +88,31 @@ normalization flag are read from `params/agent.yaml` next to it when present.
 Copy the matching motion `.npz` into `tasks/bm154/robots/k1/motions/` and add a
 `ControllerCfg` in `tasks/bm154/robots/k1/__init__.py` that points to both.
 
+### Training with Booster's booster_train and deploying here
+
+[booster_train](https://github.com/BoosterRobotics/booster_train) is Booster's
+Isaac Lab port of BeyondMimic, the code their own K1 dances (`k1_fight`,
+`k1_mj2`) were trained with: delayed PD actuators with torque-speed curves,
+extra foot/hand/trunk pose rewards, the estimator-free anchor-orientation
+observation. `scripts/booster_train_pipeline.py` moves motions in and
+policies out:
+
+```bash
+# 1. retargeted K1 CSV (Booster format, 50 Hz) -> booster_train motion + task
+python scripts/booster_train_pipeline.py --python <isaaclab python> motion \
+    --csv k1_dance_floss_marg_stmr.csv --name dance_floss_stmr
+# 2. train in booster_train (command printed by step 1)
+# 3. trained run -> exported policy + motion in tasks/beyond_mimic/robots/k1
+python scripts/booster_train_pipeline.py deploy \
+    --run <booster_train>/logs/rsl_rl/k1_dance_floss_stmr/<run> --name dance_floss_stmr
+```
+
+Step 3 prints the `register_booster_train_dance(...)` line to add to
+`tasks/beyond_mimic/robots/k1/__init__.py`; the deploy task then uses the
+`BeyondMimicPolicy` observation with the gains Booster deploys its K1 dances
+with. Our booster_train checkout carries a branch that renames its K1 config to
+the official `booster_assets` names and adds an Isaac Lab 2.1 shim.
+
 ### Run Sim2Sim (MuJoCo)
 
 - Download and install BoosterAssets:
