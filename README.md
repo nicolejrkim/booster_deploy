@@ -161,7 +161,17 @@ itself (`--sim-args=` passes options through; the `=` form is needed because
 the values start with dashes):
 
 ```bash
-python scripts/deploy.py --task k1_bm154_jamesbrown --sim --sim-args="--band"
+python scripts/deploy.py --task k1_bm154_jamesbrown --sim --sim-args="--rtf 0.5"
+```
+
+Add `--monitor` to also start the live monitor (below) from the same command,
+so one terminal brings up the simulator, the controller and the monitor. The
+simulator then runs headless and the monitor window is the view; append
+`--viewer` to `--sim-args` to keep the simulator's own window as well.
+`--monitor-args=` passes options to the monitor:
+
+```bash
+python scripts/deploy.py --task k1_bm154_jamesbrown --sim --monitor
 ```
 
 Then drive the state machine from terminal 2 exactly as on the robot (`x`,
@@ -181,13 +191,6 @@ PD torque exceeds a joint's limit before clamping it, as crl-humanoid-ros'
 simulator does. The deploy prints the same warning on the real robot from
 the torque the firmware will compute for each command.
 
-**Elastic band.** `--band` attaches a slack rope to the trunk: no force
-while the trunk is at or above the anchor height (the spawn height by
-default), and a spring-damper catch (`--band-stiffness`, `--band-damping`)
-when it drops below, so policies can be tried without falls while standing
-and walking are unaffected. Toggle it at runtime with `E` in the simulator
-window, `B` in the monitor, or the `elastic_band` service (`std_srvs/SetBool`).
-
 ### Live monitor
 
 `scripts/monitor.py` watches a running deployment, real or simulated, from
@@ -199,11 +202,15 @@ python scripts/monitor.py --robot k1 --no-viewer  # status line only (SSH)
 python scripts/monitor.py --robot k1 --log run1   # also record the stream
 ```
 
+`deploy.py --monitor` starts it next to the deployment on the same machine
+(its output goes to `logs/monitor.log`; `--monitor-args="--log run1"` passes
+options through) and stops it after the robot has been handed back.
+
 It poses the model from `/low_state` (encoders and IMU, feet kept on the
 floor) and places it with `/odometer_state` (`booster_interface/Odometer`,
 published by the robot firmware and by the simulator; without it the robot
-stays at the origin and steps in place), draws a translucent ghost at the
-`/joint_ctrl` targets and a floating label with the FSM state, and prints the
+stays at the origin and steps in place), draws a floating label with the
+FSM state, and prints the
 topic rates, the largest joint tracking error, the largest torque relative to
 the effort limit (flagged `TORQUE LIMIT` at 95 %), joints outside their angle
 range, the trunk tilt and, against the simulator, the foot contact forces.
@@ -212,10 +219,16 @@ Keys in the monitor window:
 | Key | Action |
 |-----|--------|
 | `M` | show/hide the state-machine panel |
-| `Up`/`Down`, `Enter` | select a state in the panel and request the transition |
-| `B` | toggle the simulator's elastic band |
+| `Up`/`Down`, `Enter` | select a state in the panel and request the transition; the deployment's verdict appears under the list |
 | `N` | show/hide the status text |
 | `V` | camera follows the robot on/off |
+
+Every request is answered by the deployment on `booster_deploy/fsm_result`
+(`OK STAND`, `REJECTED TASK: not allowed from IDLE`, `IGNORED STAND: already
+the current state`, `FAILED STAND: unsafe posture, switched to Damping`). The
+panel shows the verdict for a few seconds and the monitor logs it; a request
+that nothing answers within 2 s is reported as `NO RESPONSE`, which means no
+`deploy.py` is listening.
 
 ### Run Sim2Real (Real Robots)
 
@@ -316,10 +329,14 @@ any --B--> ESTOP --Y--> IDLE                      Ctrl+C: exit_mode, then quit
   get-up (`GetUpWithMode`, `booster.getup_version` 0 = V1, 1 = V2 on K1) and
   waits until the robot reports Walking mode.
 - Transitions can also be requested by name on the `booster_deploy/fsm_request`
-  topic (`std_msgs/String`, used by the monitor), and the current state is
-  published latched on `booster_deploy/fsm_state`:
+  topic (`std_msgs/String`, used by the monitor). The current state is
+  published latched on `booster_deploy/fsm_state`, and every request (topic,
+  keyboard or gamepad) gets a verdict on `booster_deploy/fsm_result`
+  (`OK`, `REJECTED`, `IGNORED` or `FAILED`, followed by the target and a
+  reason):
 
   ```bash
+  ros2 topic echo /booster_deploy/fsm_result &
   ros2 topic pub --once /booster_deploy/fsm_request std_msgs/msg/String "{data: STAND}"
   ```
 

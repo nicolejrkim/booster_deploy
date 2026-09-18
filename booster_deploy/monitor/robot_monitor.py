@@ -7,12 +7,12 @@ Subscribes to the topics a deployment uses (``/low_state``, ``/joint_ctrl``,
   feet kept on the floor; its position and heading come from
   ``/odometer_state`` when that is published (robot firmware, simulator),
   otherwise it stays at the origin;
-- a translucent ghost at the commanded joint targets from ``/joint_ctrl``;
 - a floating label with the deployment's FSM state;
 - a state-machine panel (key ``M``) listing the states, the current one and
   the transitions allowed from it; ``Up``/``Down`` select and ``Enter``
-  requests the transition on ``booster_deploy/fsm_request``;
-- the simulator's elastic band state (key ``B`` toggles it);
+  requests the transition on ``booster_deploy/fsm_request``; the
+  deployment's verdict (``booster_deploy/fsm_result``: accepted, rejected,
+  failed) is shown in the panel, as is a request that nothing answered;
 - the simulator's ground-truth foot contact forces, and warnings when a
   joint runs at its torque limit or outside its angle range.
 
@@ -42,8 +42,7 @@ from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy,
 )
-from std_msgs.msg import Bool, Float32MultiArray, String
-from std_srvs.srv import SetBool
+from std_msgs.msg import Float32MultiArray, String
 
 from ..controllers.controller_cfg import RobotCfg
 from ..fsm import STATES, TRANSITIONS
@@ -51,6 +50,10 @@ from ..simulator.booster_robot_sim import lowest_collision_point
 
 # GLFW key codes used by the viewer's key callback.
 _KEY_ENTER, _KEY_UP, _KEY_DOWN = 257, 265, 264
+# How long a transition verdict stays in the panel, and how long to wait for
+# one before reporting that no deployment answered the request.
+_RESULT_SHOW_S = 5.0
+_RESULT_TIMEOUT_S = 2.0
 
 
 def quat_from_euler_xyz(rpy: np.ndarray) -> np.ndarray:
@@ -89,7 +92,6 @@ class RobotMonitor(Node):
         robot_cfg: RobotCfg,
         *,
         log_path: Optional[str] = None,
-        ghost_rgba=(0.2, 0.8, 0.2, 0.3),
         node_name: str = "booster_robot_monitor",
     ) -> None:
         super().__init__(node_name)
@@ -99,10 +101,7 @@ class RobotMonitor(Node):
             "{BOOSTER_ASSETS_DIR}", str(BOOSTER_ASSETS_DIR))
         self.model = mujoco.MjModel.from_xml_path(mjcf_path)
         self.data = mujoco.MjData(self.model)
-        self.ghost_data = mujoco.MjData(self.model)
         self.effort_limit = np.asarray(robot_cfg.effort_limit, dtype=np.float64)
-        self.ghost_rgba = np.asarray(ghost_rgba, dtype=np.float32)
-        self._ghost_option = mujoco.MjvOption()
 
         joint_names = [self.model.joint(i).name
                        for i in range(1, self.model.njnt)]
@@ -121,7 +120,11 @@ class RobotMonitor(Node):
         self.kp_cmd = np.zeros(self.num_joints)
         self.kd_cmd = np.zeros(self.num_joints)
         self.fsm_state = "?"
-        self.band_state: Optional[bool] = None  # None: no simulator band
+        # Deployment's verdict on the last transition request, when it
+        # arrived, and the request still waiting for one (target, sent at).
+        self.fsm_result: Optional[str] = None
+        self._fsm_result_time = 0.0
+        self._awaiting: Optional[tuple[str, float]] = None
         self.odom: Optional[np.ndarray] = None  # x, y, theta
         self._odom_rate = _RateMeter()
         self.contact: Optional[np.ndarray] = None  # N per foot (simulator)
@@ -138,7 +141,6 @@ class RobotMonitor(Node):
         self._follow = True
         self._selected = 0
         self._pending_request: Optional[str] = None
-        self._pending_band: Optional[bool] = None
 
         self._log_path = log_path
         self._log: dict[str, list] = {
@@ -167,12 +169,13 @@ class RobotMonitor(Node):
         self.create_subscription(
             String, "booster_deploy/fsm_state", self._on_fsm_state, latched)
         self.create_subscription(
-            Bool, "booster_sim/elastic_band", self._on_band_state, latched)
+            String, "booster_deploy/fsm_result", self._on_fsm_result,
+            QoSProfile(depth=4, reliability=ReliabilityPolicy.RELIABLE,
+                       history=HistoryPolicy.KEEP_LAST))
         self._request_pub = self.create_publisher(
             String, "booster_deploy/fsm_request",
             QoSProfile(depth=4, reliability=ReliabilityPolicy.RELIABLE,
                        history=HistoryPolicy.KEEP_LAST))
-        self._band_client = self.create_client(SetBool, "elastic_band")
         self.get_logger().info(
             f"monitoring {robot_cfg.name}: /low_state, /joint_ctrl, "
             "booster_deploy/fsm_state")
@@ -229,26 +232,44 @@ class RobotMonitor(Node):
         with self._lock:
             self.fsm_state = msg.data
 
-    def _on_band_state(self, msg: Bool) -> None:
+    def _on_fsm_result(self, msg: String) -> None:
+        text = msg.data.strip()
         with self._lock:
-            self.band_state = bool(msg.data)
+            self.fsm_result = text
+            self._fsm_result_time = time.perf_counter()
+            self._awaiting = None
+        # rclpy caches the severity per call site: keep two statements.
+        if text.startswith("OK "):
+            self.get_logger().info(f"deploy: {text}")
+        else:
+            self.get_logger().warning(f"deploy: {text}")
 
     # ------------------------------------------------------------ requests
     def request_state(self, target: str) -> None:
-        """Ask the deployment for a transition (validated on its side)."""
+        """Ask the deployment for a transition.  It validates the request
+        and answers on ``booster_deploy/fsm_result``."""
+        with self._lock:
+            self._awaiting = (target, time.perf_counter())
         self._request_pub.publish(String(data=target))
         self.get_logger().info(f"requested state {target}")
 
-    def toggle_band(self) -> None:
-        if not self._band_client.service_is_ready():
-            self.get_logger().warning(
-                "no elastic_band service (not running against the simulator)")
-            return
+    def _result_text(self) -> Optional[str]:
+        """The verdict to show in the panel, or None once it has aged out.
+        A request that got no answer within ``_RESULT_TIMEOUT_S`` becomes a
+        verdict of its own (no deployment is listening)."""
+        now = time.perf_counter()
         with self._lock:
-            enable = not bool(self.band_state)
-        self._band_client.call_async(SetBool.Request(data=enable))
-        self.get_logger().info(
-            f"elastic band {'on' if enable else 'off'} requested")
+            awaiting = self._awaiting
+            if awaiting is not None and now - awaiting[1] > _RESULT_TIMEOUT_S:
+                self._awaiting = None
+                self.fsm_result = (f"NO RESPONSE {awaiting[0]}: "
+                                   "is deploy.py running?")
+                self._fsm_result_time = now
+                self.get_logger().warning(self.fsm_result)
+            if (self.fsm_result is not None
+                    and now - self._fsm_result_time <= _RESULT_SHOW_S):
+                return self.fsm_result
+        return None
 
     def _on_key(self, keycode: int) -> None:
         """Viewer key callback (GUI thread): only flips flags."""
@@ -258,8 +279,6 @@ class RobotMonitor(Node):
             self._show_info = not self._show_info
         elif keycode == ord("V"):
             self._follow = not self._follow
-        elif keycode == ord("B"):
-            self._pending_band = True
         elif keycode == _KEY_UP and self._show_panel:
             self._selected = (self._selected - 1) % len(STATES)
         elif keycode == _KEY_DOWN and self._show_panel:
@@ -271,17 +290,10 @@ class RobotMonitor(Node):
         request, self._pending_request = self._pending_request, None
         if request is not None:
             self.request_state(request)
-        if self._pending_band:
-            self._pending_band = None
-            self.toggle_band()
 
     def _overlay_texts(self, state: str) -> list:
         texts = []
         if self._show_info:
-            with self._lock:
-                band = self.band_state
-            band_text = ("n/a" if band is None else
-                         ("ON" if band else "OFF"))
             with self._lock:
                 odom = None if self.odom is None else self.odom.copy()
                 odom_live = self._odom_rate.hz() > 0
@@ -302,11 +314,11 @@ class RobotMonitor(Node):
                         + ("  LIMIT!" if tau_frac[i_tau] >= 0.95 else ""))
             left = ("booster_deploy monitor\n"
                     "state\nlow_state\njoint_ctrl\nodometry\n"
-                    "contact L/R\ntorque/limit\nelastic band\n\n"
-                    "M panel  B band  N info  V follow")
+                    "contact L/R\ntorque/limit\n\n"
+                    "M panel  N info  V follow")
             right = ("\n" f"{state}\n{self._state_rate.hz():.0f} Hz\n"
                      f"{self._cmd_rate.hz():.0f} Hz\n{odom_text}\n"
-                     f"{contact_text}\n{tau_text}\n{band_text}\n")
+                     f"{contact_text}\n{tau_text}\n")
             texts.append((int(mujoco.mjtFontScale.mjFONTSCALE_150),
                           int(mujoco.mjtGridPos.mjGRID_TOPLEFT), left, right))
         if self._show_panel:
@@ -320,6 +332,11 @@ class RobotMonitor(Node):
                               ("allowed" if allowed else "-"))
             names.append("Up/Down select, Enter switch")
             status.append("")
+            result = self._result_text()
+            if result is not None:
+                verdict, _, detail = result.partition(": ")
+                names.append(verdict)
+                status.append(detail)
             texts.append((int(mujoco.mjtFontScale.mjFONTSCALE_150),
                           int(mujoco.mjtGridPos.mjGRID_TOPRIGHT),
                           "\n".join(names), "\n".join(status)))
@@ -378,7 +395,6 @@ class RobotMonitor(Node):
     def _update_pose(self) -> None:
         with self._lock:
             q, rpy = self.q.copy(), self.rpy.copy()
-            q_cmd = None if self.q_cmd is None else self.q_cmd.copy()
             state = self.fsm_state
             odom = None if self.odom is None else self.odom.copy()
         self.data.qpos[:3] = 0.0
@@ -391,21 +407,12 @@ class RobotMonitor(Node):
         mujoco.mj_kinematics(self.model, self.data)
         self.data.qpos[2] -= lowest_collision_point(self.model, self.data)
         mujoco.mj_kinematics(self.model, self.data)
-        self.ghost_data.qpos[:7] = self.data.qpos[:7]
-        self.ghost_data.qpos[7:] = q if q_cmd is None else q_cmd
-        mujoco.mj_kinematics(self.model, self.ghost_data)
         return state
 
-    def _draw_overlay(self, viewer, state: str, show_ghost: bool) -> None:
+    def _draw_overlay(self, viewer, state: str) -> None:
+        """Floating label with the FSM state above the robot."""
         scn = viewer.user_scn
-        if show_ghost:
-            mujoco.mjv_updateScene(
-                self.model, self.ghost_data, self._ghost_option, None,
-                viewer.cam, int(mujoco.mjtCatBit.mjCAT_DYNAMIC), scn)
-            for i in range(scn.ngeom):
-                scn.geoms[i].rgba[:] = self.ghost_rgba
-        else:
-            scn.ngeom = 0
+        scn.ngeom = 0
         if scn.ngeom < scn.maxgeom:
             g = scn.geoms[scn.ngeom]
             pos = self.data.qpos[:3] + np.array([0.0, 0.0, 0.45])
@@ -415,7 +422,7 @@ class RobotMonitor(Node):
             g.label = f"{state}"
             scn.ngeom += 1
 
-    def run(self, viewer: bool = True, show_ghost: bool = True) -> None:
+    def run(self, viewer: bool = True) -> None:
         executor = SingleThreadedExecutor()
         executor.add_node(self)
 
@@ -430,7 +437,7 @@ class RobotMonitor(Node):
         self._spin_thread = spin_thread
         try:
             if viewer:
-                self._run_viewer(show_ghost)
+                self._run_viewer()
             else:
                 last = 0.0
                 while not self._stop.is_set():
@@ -450,7 +457,7 @@ class RobotMonitor(Node):
         while not self._stop.is_set() and rclpy.ok():
             executor.spin_once(timeout_sec=0.1)
 
-    def _run_viewer(self, show_ghost: bool) -> None:
+    def _run_viewer(self) -> None:
         import mujoco.viewer
 
         with mujoco.viewer.launch_passive(
@@ -466,7 +473,7 @@ class RobotMonitor(Node):
                 self._service_pending()
                 state = self._update_pose()
                 with v.lock():
-                    self._draw_overlay(v, state, show_ghost)
+                    self._draw_overlay(v, state)
                     if self._follow:
                         v.cam.lookat[:] = self.data.qpos[:3]
                 texts = self._overlay_texts(state)

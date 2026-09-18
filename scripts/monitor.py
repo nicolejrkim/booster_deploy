@@ -5,8 +5,8 @@
     python scripts/monitor.py --robot k1
 
 Shows the robot posed from /low_state (encoders + IMU, feet on the floor)
-and /odometer_state, a ghost at the /joint_ctrl targets and the deployment's
-FSM state, and prints rates, tracking error, torque and tilt.
+and /odometer_state with the deployment's FSM state, and prints rates,
+tracking error, torque and tilt.
 ``--no-viewer`` prints only.
 """
 import argparse
@@ -21,8 +21,6 @@ parser = argparse.ArgumentParser(
 parser.add_argument("--robot", choices=("k1", "t1", "t2"), default="k1")
 parser.add_argument("--no-viewer", action="store_true", default=False,
                     help="terminal status line only (no display needed)")
-parser.add_argument("--no-ghost", action="store_true", default=False,
-                    help="do not draw the commanded-target ghost")
 parser.add_argument("--log", type=str, default=None,
                     help="record the received stream to this .npz")
 args = parser.parse_args()
@@ -42,7 +40,7 @@ def main():
 
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     monitor = RobotMonitor(robot_cfg, log_path=args.log)
-    monitor.run(viewer=not args.no_viewer, show_ghost=not args.no_ghost)
+    monitor.run(viewer=not args.no_viewer)
     # run() has stopped its threads and saved the log.  ROS 2 / DDS teardown
     # occasionally hangs after a viewer session; there is nothing left to do.
     sys.stdout.flush()

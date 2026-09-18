@@ -17,13 +17,6 @@ Custom mode are retained and applied at the switch.
 
 The IMU is taken as the floating base frame (the K1/T1/T2 MJCF ``imu`` site
 sits at the trunk origin with identity orientation).
-
-An optional *elastic band* (as in crl-humanoid-ros) is a slack rope on the
-trunk: it applies no force while the trunk is at or above its anchor height
-(the spawn height by default), and catches the robot with a spring-damper
-when it drops below, so policies can be tried without falls while standing
-and walking stay unaffected.  Toggle it with the ``elastic_band``
-``std_srvs/SetBool`` service or the ``E`` key in the viewer.
 """
 from __future__ import annotations
 
@@ -43,10 +36,9 @@ from booster_interface.srv import RpcService
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (
-    DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy,
+    HistoryPolicy, QoSProfile, ReliabilityPolicy,
 )
-from std_msgs.msg import Bool, Float32MultiArray
-from std_srvs.srv import SetBool
+from std_msgs.msg import Float32MultiArray
 
 from ..controllers.controller_cfg import RobotCfg
 
@@ -140,10 +132,6 @@ class BoosterRobotSim(Node):
         init_joint_pos: Optional[list[float]] = None,
         mode_transition_s: float = 1.0,
         log_states: Optional[str] = None,
-        elastic_band: bool = False,
-        band_height: Optional[float] = None,
-        band_stiffness: float = 2000.0,
-        band_damping: float = 100.0,
         node_name: str = "booster_robot_sim",
     ) -> None:
         super().__init__(node_name)
@@ -187,16 +175,6 @@ class BoosterRobotSim(Node):
 
         self._reset_pose(init_pos)
 
-        # --- elastic band (virtual harness on the trunk) ---
-        self.band_enabled = bool(elastic_band)
-        self.band_stiffness = float(band_stiffness)
-        self.band_damping = float(band_damping)
-        self._band_body = 1  # trunk: first body after the world
-        # Anchor height: the rope is slack above it.  Default: the spawn
-        # height, so a standing or walking robot never feels the band.
-        self.band_height = (float(self.data.qpos[2]) if band_height is None
-                            else float(band_height))
-
         # --- ROS 2 interface (names match the robot firmware) ---
         self._low_state_pub = self.create_publisher(
             LowState, "/low_state",
@@ -232,13 +210,6 @@ class BoosterRobotSim(Node):
                        history=HistoryPolicy.KEEP_LAST),
         )
         self.create_service(RpcService, "booster_rpc_service", self._on_rpc)
-        self.create_service(SetBool, "elastic_band", self._on_elastic_band)
-        self._band_pub = self.create_publisher(
-            Bool, "booster_sim/elastic_band",
-            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
-                       durability=DurabilityPolicy.TRANSIENT_LOCAL,
-                       history=HistoryPolicy.KEEP_LAST))
-        self._band_pub.publish(Bool(data=self.band_enabled))
 
         self._low_state = LowState()
         self._low_state.motor_state_serial = [
@@ -356,36 +327,6 @@ class BoosterRobotSim(Node):
             self.get_logger().warning(
                 f"RPC api_id={api_id} is not simulated; replying status 0")
         return response
-
-    def _on_elastic_band(self, request, response):
-        self.set_elastic_band(bool(request.data))
-        response.success = True
-        response.message = (
-            f"elastic band {'enabled' if self.band_enabled else 'disabled'}")
-        return response
-
-    def set_elastic_band(self, enabled: bool) -> None:
-        with self._lock:
-            self.band_enabled = enabled
-            if not enabled:
-                self.data.xfrc_applied[self._band_body, :] = 0.0
-        self._band_pub.publish(Bool(data=enabled))
-        self.get_logger().info(
-            f"elastic band {'ON' if enabled else 'OFF'} "
-            f"(slack above z={self.band_height:.2f} m, "
-            f"k={self.band_stiffness:.0f} N/m, c={self.band_damping:.0f} Ns/m)")
-
-    def _apply_elastic_band(self) -> None:
-        """Slack rope: upward spring-damper only below the anchor height."""
-        pos = self.data.xpos[self._band_body]
-        vel = self.data.cvel[self._band_body, 3:6]  # linear part, world
-        drop = self.band_height - pos[2]
-        force = 0.0
-        if drop > 0.0:
-            force = self.band_stiffness * drop - self.band_damping * vel[2]
-            force = max(force, 0.0)  # a rope cannot push down
-        self.data.xfrc_applied[self._band_body, :] = 0.0
-        self.data.xfrc_applied[self._band_body, 2] = force
 
     def _teleport_upright(self) -> None:
         with self._lock:
@@ -510,8 +451,6 @@ class BoosterRobotSim(Node):
                 self._check_torque_limits(tau)
                 self.data.ctrl[:] = np.clip(
                     tau, -self.force_limit, self.force_limit)
-                if self.band_enabled:
-                    self._apply_elastic_band()
                 mujoco.mj_step(self.model, self.data)
                 step += 1
                 report_steps += 1
@@ -540,7 +479,6 @@ class BoosterRobotSim(Node):
                     f"mode={RobotMode.NAMES[self.mode]:8s} "
                     f"z={self.data.qpos[2]:.3f} rtf={rtf:.2f} "
                     f"joint_ctrl#={self._cmd_count}"
-                    + (" band=ON" if self.band_enabled else "")
                     + (f" lag_resets={self._lag_steps}"
                        if self._lag_steps else ""))
                 last_report = now
@@ -587,18 +525,12 @@ class BoosterRobotSim(Node):
     def _run_viewer(self) -> None:
         import mujoco.viewer
 
-        def on_key(keycode: int) -> None:
-            if keycode == ord("E"):
-                self.set_elastic_band(not self.band_enabled)
-
         with mujoco.viewer.launch_passive(
             self.model, self.data,
             show_left_ui=False, show_right_ui=False,
-            key_callback=on_key,
         ) as v:
             v.cam.elevation = -20
             v.cam.distance = 2.0
-            self.get_logger().info("viewer: press E to toggle the elastic band")
             while v.is_running() and not self._stop.is_set():
                 with self._lock:
                     v.cam.lookat[:] = self.data.qpos[:3]

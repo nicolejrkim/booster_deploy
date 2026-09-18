@@ -22,7 +22,15 @@ parser.add_argument("--sim", action="store_true", default=False,
 parser.add_argument("--sim-args", type=str, default="",
                     help="extra arguments for scripts/sim_robot.py with "
                          "--sim; use the = form, e.g. "
-                         "--sim-args=\"--band --rtf 0.5\"")
+                         "--sim-args=\"--rtf 0.5\"")
+parser.add_argument("--monitor", action="store_true", default=False,
+                    help="also start the live monitor (scripts/monitor.py) "
+                         "for the task's robot; with --sim the simulator "
+                         "then runs headless and the monitor is the window")
+parser.add_argument("--monitor-args", type=str, default="",
+                    help="extra arguments for scripts/monitor.py with "
+                         "--monitor; use the = form, e.g. "
+                         "--monitor-args=\"--log run1\"")
 parser.add_argument(
     "--device", type=str, default="cpu",
     help="Device to run the evaluation on (e.g., 'cpu', 'cuda')")
@@ -35,28 +43,34 @@ parser.add_argument(
 args = parser.parse_args()
 
 
-def start_simulated_robot(task_cfg):
-    """Launch scripts/sim_robot.py for the task's robot as a subprocess."""
+def robot_short_name(task_cfg):
+    """The robot family (k1, t1, t2) the helper scripts take."""
     name = task_cfg.robot.name.lower()
     robot = next((r for r in ("k1", "t1", "t2") if r in name), None)
     if robot is None:
-        raise RuntimeError(f"no simulated robot for {task_cfg.robot.name!r}")
+        raise RuntimeError(f"unknown robot family {task_cfg.robot.name!r}")
+    return robot
+
+
+def start_helper(label, script_name, script_args, log_name):
+    """Run scripts/<script_name> as a subprocess in its own process group.
+
+    The terminal's Ctrl+C then reaches only the deploy, which hands the
+    robot back first and stops the helpers afterwards (stop_helper).
+    """
     os.makedirs("logs", exist_ok=True)
-    log_path = os.path.join("logs", "sim_robot.log")
+    log_path = os.path.join("logs", log_name)
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "sim_robot.py")
-    cmd = [sys.executable, script, "--robot", robot, "--viewer",
-           *shlex.split(args.sim_args)]
-    # Own process group: the terminal's Ctrl+C reaches only the deploy,
-    # which hands the robot back first and then stops the simulator.
+                          script_name)
     process = subprocess.Popen(
-        cmd, stdout=open(log_path, "w"), stderr=subprocess.STDOUT,
+        [sys.executable, script, *script_args],
+        stdout=open(log_path, "w"), stderr=subprocess.STDOUT,
         start_new_session=True)
-    print(f"Simulated robot started (pid {process.pid}, log {log_path})")
+    print(f"{label} started (pid {process.pid}, log {log_path})")
     return process
 
 
-def stop_simulated_robot(process):
+def stop_helper(label, process):
     if process is None or process.poll() is not None:
         return
     process.send_signal(signal.SIGINT)
@@ -65,7 +79,25 @@ def stop_simulated_robot(process):
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait(timeout=2.0)
-    print("Simulated robot stopped")
+    print(f"{label} stopped")
+
+
+def start_simulated_robot(task_cfg):
+    """scripts/sim_robot.py for the task's robot.  Headless when the
+    monitor provides the window (add --viewer to --sim-args for both)."""
+    script_args = ["--robot", robot_short_name(task_cfg)]
+    if not args.monitor:
+        script_args.append("--viewer")
+    script_args += shlex.split(args.sim_args)
+    return start_helper("Simulated robot", "sim_robot.py", script_args,
+                        "sim_robot.log")
+
+
+def start_monitor(task_cfg):
+    """scripts/monitor.py for the task's robot."""
+    script_args = ["--robot", robot_short_name(task_cfg),
+                   *shlex.split(args.monitor_args)]
+    return start_helper("Monitor", "monitor.py", script_args, "monitor.log")
 
 
 def main():
@@ -103,6 +135,8 @@ def main():
 
     if args.sim and args.mujoco:
         parser.error("--sim and --mujoco are mutually exclusive")
+    if args.monitor and args.mujoco:
+        parser.error("--monitor needs the ROS 2 path (not --mujoco)")
 
     # decide how to run based on flags
     if args.mujoco:
@@ -113,11 +147,13 @@ def main():
     else:
         from booster_deploy.controllers.booster_robot_controller import BoosterRobotPortal
         sim_process = start_simulated_robot(task_cfg) if args.sim else None
+        monitor_process = start_monitor(task_cfg) if args.monitor else None
         try:
             with BoosterRobotPortal(task_cfg) as portal:
                 portal.run()
         finally:
-            stop_simulated_robot(sim_process)
+            stop_helper("Monitor", monitor_process)
+            stop_helper("Simulated robot", sim_process)
         # The portal has handed the robot back and joined its threads and
         # processes.  Interpreter teardown of a forked ROS 2 / DDS process can
         # occasionally hang; do not let that leave a zombie deployment behind.

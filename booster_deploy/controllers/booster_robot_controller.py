@@ -96,6 +96,7 @@ class BoosterRobotPortal:
         self.inference_process = None  # Inference process reference
         self.low_cmd_publisher: rclpy.publisher.Publisher = None
         self.fsm_state_publisher = None
+        self.fsm_result_publisher = None
         self.low_state_thread = None
         self.low_cmd_process: mp.Process | None = None
 
@@ -348,6 +349,14 @@ class BoosterRobotPortal:
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
                 history=HistoryPolicy.KEEP_LAST,
             ),
+        )
+        # Verdict on each transition request, for the monitor: "OK STAND",
+        # "REJECTED TASK: not allowed from IDLE", "FAILED STAND: <why>".
+        self.fsm_result_publisher = self.publish_node.create_publisher(
+            String,
+            "booster_deploy/fsm_result",
+            QoSProfile(depth=4, reliability=ReliabilityPolicy.RELIABLE,
+                       history=HistoryPolicy.KEEP_LAST),
         )
 
         return publisher
@@ -771,6 +780,8 @@ class BoosterRobotPortal:
             self.logger.warning(
                 "Transition %s -> %s is not allowed (allowed: %s)",
                 fsm.current, target, ", ".join(fsm.targets()) or "none")
+            self._fsm_publish_result(
+                "REJECTED", target, f"not allowed from {fsm.current}")
             return False
         current = fsm.current
         ok = True
@@ -783,6 +794,8 @@ class BoosterRobotPortal:
                 self._change_robot_mode("damping")
                 fsm.switch(ESTOP)
                 self._fsm_print_state()
+                self._fsm_publish_result(
+                    "FAILED", target, "unsafe posture, switched to Damping")
                 return False
             ok = status == "ok" and self._fsm_request(STAND)
             if not ok:
@@ -804,10 +817,21 @@ class BoosterRobotPortal:
             ok = self._fsm_request(target)
         if not ok:
             self.logger.error("Transition %s -> %s failed", current, target)
+            self._fsm_publish_result(
+                "FAILED", target, f"{current} -> {target} failed")
             return False
         fsm.switch(target)
         self._fsm_print_state()
+        self._fsm_publish_result("OK", target)
         return True
+
+    def _fsm_publish_result(self, verdict: str, target: str,
+                            reason: str = "") -> None:
+        """Report the outcome of a transition request on
+        ``booster_deploy/fsm_result`` (the monitor shows it)."""
+        text = f"{verdict} {target}" + (f": {reason}" if reason else "")
+        if self.fsm_result_publisher is not None:
+            self.fsm_result_publisher.publish(String(data=text))
 
     def _fsm_map_press(self, press: str):
         """Map a logical button (x, a, y, b) to a target state, or None."""
@@ -956,7 +980,12 @@ class BoosterRobotPortal:
                 if requested not in self._fsm.states:
                     self.logger.warning(
                         "Ignoring unknown state request %r", requested)
-                elif requested != self._fsm.current:
+                    self._fsm_publish_result(
+                        "REJECTED", requested, "unknown state")
+                elif requested == self._fsm.current:
+                    self._fsm_publish_result(
+                        "IGNORED", requested, "already the current state")
+                else:
                     self.logger.info("State %s requested over topic", requested)
                     self.fsm_transition(requested)
             if (
