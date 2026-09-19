@@ -3,6 +3,35 @@
 Booster Deploy is a lightweight deployment framework that supports running control policies on Booster robots (sim2real) and MuJoCo (sim2sim). The system adopts many well-established designs from IsaacLab to provide modular abstractions, allowing unified policy execution across simulated and real platforms.
 
 
+## What's new in this branch
+
+> **Added in this branch.** Everything in this section comes from the
+> features added on the `feat/monitor-verdicts` branch on top of `main`.
+> The detailed sections below that describe them carry the same notice.
+
+- **Transition verdicts.** Every state-machine request, whether it comes
+  from the keyboard, a gamepad or the `booster_deploy/fsm_request` topic,
+  is answered by the deployment on `booster_deploy/fsm_result` with `OK`,
+  `REJECTED`, `IGNORED` or `FAILED`, the target state and a reason. See
+  [Deployment state machine](#deployment-state-machine).
+- **Verdicts in the monitor.** The monitor's state-machine panel shows the
+  deployment's answer to the request it just sent for a few seconds and
+  logs it, and reports `NO RESPONSE` when nothing answers within 2 s.
+  See [Live monitor](#live-monitor).
+- **`deploy.py --monitor`.** The deployment can start the live monitor
+  next to itself and stop it after the robot has been handed back
+  (`--monitor-args=` passes options through, output in
+  `logs/monitor.log`). Combined with `--sim`, the simulator runs headless
+  and the monitor window is the only window, so one command brings up the
+  simulator, the controller and the monitor. See
+  [Software-in-the-loop](#software-in-the-loop-the-real-robot-path-against-a-simulated-robot).
+- **Removed.** The simulator's elastic band (`--band`, the `elastic_band`
+  service, key `E` in the simulator window and `B` in the monitor) and
+  the monitor's translucent ghost at the `/joint_ctrl` targets
+  (`--no-ghost`) are gone. The monitor shows the measured pose and the
+  FSM label only.
+
+
 ## Prerequisites
 
 | Environment | Notes |
@@ -164,6 +193,10 @@ the values start with dashes):
 python scripts/deploy.py --task k1_bm154_jamesbrown --sim --sim-args="--rtf 0.5"
 ```
 
+> **Added in this branch.** `--monitor` and `--monitor-args=` are among the
+> features added on this branch (see
+> [What's new in this branch](#whats-new-in-this-branch)).
+
 Add `--monitor` to also start the live monitor (below) from the same command,
 so one terminal brings up the simulator, the controller and the monitor. The
 simulator then runs headless and the monitor window is the view; append
@@ -192,6 +225,12 @@ simulator does. The deploy prints the same warning on the real robot from
 the torque the firmware will compute for each command.
 
 ### Live monitor
+
+> **Added in this branch.** Starting the monitor from `deploy.py --monitor`
+> and the transition verdicts shown in the state-machine panel are among
+> the features added on this branch (see
+> [What's new in this branch](#whats-new-in-this-branch)). The elastic-band
+> key `B` and the commanded-target ghost (`--no-ghost`) were removed.
 
 `scripts/monitor.py` watches a running deployment, real or simulated, from
 any machine on the same ROS 2 domain:
@@ -339,6 +378,21 @@ any --B--> ESTOP --Y--> IDLE                      Ctrl+C: exit_mode, then quit
   ros2 topic echo /booster_deploy/fsm_result &
   ros2 topic pub --once /booster_deploy/fsm_request std_msgs/msg/String "{data: STAND}"
   ```
+
+> **Added in this branch.** The verdicts on `booster_deploy/fsm_result` are
+> among the features added on this branch (see
+> [What's new in this branch](#whats-new-in-this-branch)); `main` only
+> accepted requests on `booster_deploy/fsm_request` and published the
+> state. The verdict texts are:
+>
+> | Verdict | When |
+> |---------|------|
+> | `OK <state>` | the transition happened |
+> | `REJECTED <state>: not allowed from <current>` | not in the transition table |
+> | `REJECTED <name>: unknown state` | topic request with a name that is not a state |
+> | `IGNORED <state>: already the current state` | topic request for the current state |
+> | `FAILED STAND: unsafe posture, switched to Damping` | posture check failed on `IDLE -> STAND`; the robot is in `ESTOP` |
+> | `FAILED <state>: <current> -> <state> failed` | the mode RPC, get-up or executor hand-over failed |
 
 The same flow can be exercised without hardware with the simulated robot
 (see below).
