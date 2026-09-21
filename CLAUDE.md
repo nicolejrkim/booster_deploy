@@ -24,9 +24,10 @@ bookkeeping (joint order, gains, action scaling) lives in config objects.
   - `locomotion/` — velocity-command walking (K1/T1/T2).
   - `beyond_mimic/` — BeyondMimic motion tracking (anchor-orientation obs).
   - `bm154/` — BeyondMimic with the BM154 hardware-style obs (K1 dances).
-- `booster_deploy/fsm/` — deployment state machine (IDLE, STAND, WALK, TASK,
-  ESTOP): `StateMachine` + transition table, and the child-process
-  `FsmExecutor` that runs the active state's behaviour at 50 Hz.
+- `booster_deploy/fsm/` — deployment state machine (IDLE/ESTOP = Damping,
+  STAND = Prepare, WALK/TASK = Custom): `StateMachine` + transition table,
+  and the child-process `FsmExecutor` that runs the WALK (locomotion) or
+  TASK policy at 50 Hz.
 - `booster_deploy/simulator/` — `BoosterRobotSim`, a MuJoCo ROS 2 node that
   emulates the robot firmware interface (`/low_state`, `/joint_ctrl`,
   `booster_rpc_service`, get-up as a teleport) so the real-robot deploy path
@@ -52,6 +53,7 @@ python scripts/deploy.py --task <name> --sim      # same path against a simulate
 python scripts/deploy.py --task <name> --sim --monitor  # plus the live monitor; simulator headless, one window
 python scripts/sim_robot.py --robot k1 --viewer   # simulated robot for the line above
 python scripts/monitor.py --robot k1              # live monitor of a running deployment
+source scripts/robot_link.sh <adapter|ip> [domain]  # workstation <-> robot over one interface; then booster_link_check
 python scripts/export_rsl_rl_policy.py --checkpoint <model_N.pt> --output <prefix>
 flake8                                    # max-line-length 80, see .flake8
 ```
@@ -74,7 +76,9 @@ side effect of import; a new task only needs its package and a
   the deployed PD gains may differ from training.
 - **Gains on the real robot**: `joint_stiffness`/`joint_damping` are sent
   directly as motor Kp/Kd. `effort_limit` is only used for MuJoCo torque
-  clipping and the default action scale.
+  clipping and the default action scale. Per-task K1 Kp/Kd, effort
+  limits and action-scale sources are tabulated in the README section
+  "K1 deployment policies".
 - **Motion files** are BeyondMimic `.npz` (`fps, joint_pos, joint_vel,
   body_pos_w, body_quat_w, body_lin_vel_w, body_ang_vel_w`) in sim joint/body
   order; `MotionLoader` re-indexes by name when the file carries names.
@@ -88,12 +92,17 @@ side effect of import; a new task only needs its package and a
   is malformed; drop it from the CMakeLists). On this workstation the
   workspace is `~/stmr/booster_ros2_ws`; `.venv` (conda-based Python 3.10)
   can import Humble's `rclpy` once both setup scripts are sourced.
-- Real-robot flow is the FSM: X/`x` IDLE->STAND (posture check, primed hold,
-  Custom RPC), A/`r` forward (STAND->WALK->TASK; `prepare_mode="standing"`
-  skips WALK), Y/`n` back, B/`b` ESTOP (Damping RPC). The portal (main
-  process) validates transitions and does RPCs; the executor child
+- Real-robot flow is the FSM: X/`x` IDLE->STAND (Prepare RPC; the firmware
+  get-up first if not upright), A/`r` forward (STAND->WALK->TASK;
+  `prepare_mode="standing"` skips WALK), Y/`n` back, B/`b` ESTOP (Damping
+  RPC). STAND is the firmware's Prepare controller; WALK (the
+  `tasks/locomotion` policy) and TASK enter Custom mode (posture check,
+  primed hold) and publish; WALK<->TASK is a policy switch only. The portal
+  (main process) validates transitions and does RPCs; the executor child
   acknowledges via `fsm_active` and may request ESTOP (policy `stop()`) or
-  `after_task` (policy `finish()`). Ctrl+C hands back per `exit_mode`.
+  `after_task` (policy `finish()`). The deploy starts in the state matching
+  the robot's mode (Walking counts as IDLE) and follows the firmware when it
+  changes mode on its own. Ctrl+C hands back per `exit_mode` from WALK/TASK.
 
 ## BM154 (tasks/bm154)
 

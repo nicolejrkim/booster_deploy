@@ -12,8 +12,9 @@ Isaac Sim), and a task package ``robots/k1/<name>`` is generated from the
 
 ``deploy``: a trained ``model_<iter>.pt`` becomes a deployment task here.  The
 checkpoint is exported with ``scripts/export_rsl_rl_policy.py`` into
-``tasks/beyond_mimic/robots/k1/models``, the motion ``.npz`` is copied next to
-it, and the ``register_booster_train_dance(...)`` line to add to
+``tasks/beyond_mimic/robots/k1/models``, the motion ``.npz`` (the one named in
+the run's ``params/env.yaml``, or ``--motion``) is copied next to it, and the
+``register_booster_train_dance(...)`` line to add to
 ``tasks/beyond_mimic/robots/k1/__init__.py`` is printed.
 
 Examples:
@@ -101,6 +102,18 @@ def cmd_motion(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_motion_stem(run_dir: str) -> str | None:
+    """Stem of the motion file recorded in the run's ``params/env.yaml``."""
+    env_yaml = os.path.join(run_dir, "params", "env.yaml")
+    if not os.path.isfile(env_yaml):
+        return None
+    for line in open(env_yaml):
+        match = re.search(r"motion_file:\s*(\S+\.npz)", line)
+        if match:
+            return os.path.splitext(os.path.basename(match.group(1)))[0]
+    return None
+
+
 def cmd_deploy(args: argparse.Namespace) -> int:
     name = args.name
     run_dir = args.run
@@ -113,8 +126,8 @@ def cmd_deploy(args: argparse.Namespace) -> int:
         checkpoint = ckpts[-1]
     else:
         checkpoint = args.checkpoint
-    npz_src = os.path.join(args.booster_assets, "motions", "K1",
-                           f"k1_{name}.npz")
+    stem = args.motion or run_motion_stem(run_dir) or f"k1_{name}"
+    npz_src = os.path.join(args.booster_assets, "motions", "K1", f"{stem}.npz")
     if not os.path.isfile(npz_src):
         raise SystemExit(f"motion not found: {npz_src}")
 
@@ -123,17 +136,24 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     motions_dir = os.path.join(task_dir, "motions")
     os.makedirs(models_dir, exist_ok=True)
     os.makedirs(motions_dir, exist_ok=True)
-    out_prefix = os.path.join(models_dir, f"k1_{name}_bt")
+    suffix = {"bt": "_bt", "mj2": "_mj2_bt"}[args.gains]
+    out_prefix = os.path.join(models_dir, f"{stem}{suffix}")
     export = [sys.executable,
               os.path.join(REPO, "scripts", "export_rsl_rl_policy.py"),
               "--checkpoint", checkpoint, "--output", out_prefix]
     print(f"[deploy] exporting {checkpoint}")
     if subprocess.run(export).returncode != 0:
         raise SystemExit("export failed")
-    shutil.copy2(npz_src, os.path.join(motions_dir, f"k1_{name}.npz"))
-    print(f"[deploy] motion -> {motions_dir}/k1_{name}.npz")
-    print("\nAdd to tasks/beyond_mimic/robots/k1/__init__.py:\n"
-          f'  register_booster_train_dance("k1_bt_{name}", "k1_{name}")')
+    shutil.copy2(npz_src, os.path.join(motions_dir, f"{stem}.npz"))
+    print(f"[deploy] motion -> {motions_dir}/{stem}.npz")
+    if args.gains == "bt":
+        line = f'register_booster_train_dance("k1_bt_{name}", "{stem}")'
+    else:
+        line = (f'register_booster_train_dance("k1_bt2_{name}", "{stem}", '
+                'K1BoosterTrainMj2ControllerCfg, "_mj2_bt")')
+    print("\nAdd to tasks/beyond_mimic/robots/k1/__init__.py "
+          f"(or its BOOSTER_TRAIN{'_MJ2' if args.gains == 'mj2' else ''}"
+          f"_TASKS list):\n  {line}")
     return 0
 
 
@@ -162,6 +182,13 @@ def main() -> int:
     d.add_argument("--name", required=True, help="task name used for 'motion'")
     d.add_argument("--checkpoint", default=None,
                    help="model_<iter>.pt (default: highest iteration)")
+    d.add_argument("--gains", choices=("bt", "mj2"), default="bt",
+                   help="actuator gains the run was trained with: the "
+                        "booster_train default (bt) or BOOSTER_K1_MJ2_CFG "
+                        "(mj2); picks the file suffix and the deploy config")
+    d.add_argument("--motion", default=None,
+                   help="motion file stem in <booster_assets>/motions/K1 "
+                        "(default: the run's params/env.yaml, else k1_<name>)")
     d.set_defaults(func=cmd_deploy)
     args = parser.parse_args()
     return args.func(args)

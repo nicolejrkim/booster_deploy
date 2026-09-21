@@ -9,6 +9,14 @@ Booster Deploy is a lightweight deployment framework that supports running contr
 > features added on the `feat/monitor-verdicts` branch on top of `main`.
 > The detailed sections below that describe them carry the same notice.
 
+- **`STAND` is the firmware's Prepare mode.** `IDLE` and `ESTOP` are
+  Damping, `STAND` is Prepare (the firmware's standing controller) and
+  `WALK` and `TASK` are Custom with our policies, so X and Y follow the same
+  Damping -> Prepare sequence as Booster's remote and Custom mode is only
+  entered for a policy. Before, `STAND` was a Python PD hold in Custom mode
+  and `IDLE` was Walking mode. The deploy starts in the state matching the
+  robot's mode and follows the firmware when it changes mode on its own.
+  See [Deployment state machine](#deployment-state-machine).
 - **Transition verdicts.** Every state-machine request, whether it comes
   from the keyboard, a gamepad or the `booster_deploy/fsm_request` topic,
   is answered by the deployment on `booster_deploy/fsm_result` with `OK`,
@@ -25,6 +33,13 @@ Booster Deploy is a lightweight deployment framework that supports running contr
   and the monitor window is the only window, so one command brings up the
   simulator, the controller and the monitor. See
   [Software-in-the-loop](#software-in-the-loop-the-real-robot-path-against-a-simulated-robot).
+- **Running from the workstation over an Ethernet cable.** `source
+  scripts/robot_link.sh <adapter> [domain]` pins Fast DDS to the USB
+  Ethernet adapter and `booster_link_check` confirms the robot's bridge is
+  reachable; the deploy and the monitor can then run on the workstation
+  the way crl-humanoid-ros drives a G1, or the monitor alone while the
+  deploy runs on the robot. See
+  [Running from the workstation over an Ethernet cable](#running-from-the-workstation-over-an-ethernet-cable).
 - **Removed.** The simulator's elastic band (`--band`, the `elastic_band`
   service, key `E` in the simulator window and `B` in the monitor) and
   the monitor's translucent ghost at the `/joint_ctrl` targets
@@ -79,6 +94,80 @@ The checkpoint suffix selects the inference backend automatically:
 - `.pt`, `.jit`, `.torchscript`: TorchScript
 - `.onnx`: ONNX Runtime with the CPU execution provider
 make sure `onnxruntime` is installed in the deployment environment.
+
+### K1 deployment policies
+
+Every registered K1 task is a `ControllerCfg` that replaces the `K1_CFG`
+gains with the ones its policy was trained or tuned with, so `Kp`/`Kd` are a
+property of the task, not of the robot. In Custom mode `robot.joint_stiffness`
+and `robot.joint_damping` are sent to the motors unchanged as `kp`/`kd`
+(see [PD damping on the real robot](#pd-damping-kd-on-the-real-robot) before
+retuning `Kd`). All K1 tasks run at 50 Hz with `prepare_mode="walking"`, so
+they are reached through `IDLE -> STAND -> WALK -> TASK`.
+
+| Task | Policy / observation | Checkpoint (`tasks/<pkg>/robots/k1/models/`) | Motion (`.../motions/`) |
+|------|----------------------|-----------------------------------------------|-------------------------|
+| `k1_walk` | `locomotion`: velocity-command walking, 20 policy joints (the head holds its default pose); also the `WALK` state of every K1 task | `k1_walk.pt` | – |
+| `k1_mj2` | `beyond_mimic`: anchor-orientation motion tracking (Booster's own K1 dance) | `k1_mj_dance_002_2025-12-03_00-10-28.pt` | `k1_mj2_seg1.npz` |
+| `k1_fight` | `beyond_mimic`, as above | `k1_fight_001.pt` | `k1_fight_final_deploy.npz` |
+| `k1_bm154_jamesbrown`, `k1_bm154_floss`, `k1_bm154_boogle` | `bm154`: BeyondMimic with the 119-dim hardware-style observation (see [below](#bm154-motion-tracking-k1)) | `k1_dance_<name>_marg_bm154.pt` (`.onnx` next to it) | `k1_dance_<name>_marg_stmr.npz` |
+| `k1_bt_<name>` (27 tasks: `k1_bt_dance_{jamesbrown,floss,boogle}_stmr`, 17 showcase clips such as `k1_bt_hiphop_floss_a316`, 7 seedpicks clips `k1_bt_sp_*`; `BOOSTER_TRAIN_TASKS` in `tasks/beyond_mimic/robots/k1/__init__.py` has the list) | `beyond_mimic` observation with the booster_train actuator-model gains (see [below](#training-with-boosters-booster_train-and-deploying-here)) | `<motion>_bt.pt` | `<motion>.npz` |
+| `k1_bt2_<name>` (7 tasks, `BOOSTER_TRAIN_MJ2_TASKS`: the two STMR dances `jamesbrown`/`floss`, `high_jump_a277`, `ib_dodge_270_a437`, `turn_jump_0045_a023`, `sp_high_jump_a277`, `sp_jump_sideway_090_a024`) | the same, retrained in booster_train with the `k1_mj2` gains (`BOOSTER_K1_MJ2_CFG`) | `<motion>_mj2_bt.pt` | `<motion>.npz` |
+
+`Kp / Kd` sent per joint, left and right identical (`K1_CFG` is what a new
+task inherits; "Prepare hold" is `K1_CFG.prepare_state`, published once when
+Custom mode is entered until the policy's first action, and its `Kd` is the
+damping the executor publishes on `ESTOP` before the Damping RPC):
+
+| Joint | `K1_CFG` | Prepare hold | `k1_walk` | `k1_mj2` | `k1_fight` | `k1_bm154_*` | `k1_bt_*` | `k1_bt2_*` |
+|-------|----------|--------------|-----------|----------|------------|--------------|-----------|--------------|
+| head yaw, head pitch | 4 / 1 | 40 / 1.5 | 4 / 1 | 10 / 2 | 10 / 2 | 8 / 0.4 | 3.95 / 0.25 | 10 / 2 |
+| shoulder pitch | 4 / 1 | 40 / 0.5 | 20 / 2 | 4 / 1 | 3.95 / 0.3 | 15 / 0.5 | 3.95 / 0.25 | 4 / 1 |
+| shoulder roll | 4 / 1 | 50 / 1.5 | 20 / 2 | 4 / 1 | 3.95 / 0.3 | 15 / 0.5 | 3.95 / 0.25 | 4 / 1 |
+| elbow pitch | 4 / 1 | 20 / 0.2 | 20 / 2 | 4 / 1 | 3.95 / 0.3 | 15 / 0.5 | 3.95 / 0.25 | 4 / 1 |
+| elbow yaw | 4 / 1 | 20 / 0.2 | 20 / 2 | 4 / 1 | 3.95 / 0.3 | 15 / 0.5 | 3.95 / 0.25 | 4 / 1 |
+| hip pitch | 80 / 2 | 350 / 7.5 | 100 / 2 | 80 / 2 | 80 / 2 | 100 / 2 | 30.2 / 3.61 | 80 / 2 |
+| hip roll | 80 / 2 | 350 / 7.5 | 100 / 2 | 80 / 2 | 80 / 2 | 100 / 2 | 21.4 / 2.56 | 80 / 2 |
+| hip yaw | 80 / 2 | 180 / 3 | 100 / 2 | 80 / 2 | 80 / 2 | 100 / 2 | 17.8 / 2.13 | 80 / 2 |
+| knee | 80 / 2 | 350 / 5.5 | 100 / 2 | 80 / 2 | 80 / 2 | 100 / 2 | 60.4 / 4.81 | 80 / 2 |
+| ankle pitch | 30 / 2 | 250 / 5 | 65 / 1 | 30 / 2 | 30 / 2 | 50 / 1 | 35.7 / 4.26 | 30 / 2 |
+| ankle roll | 30 / 2 | 250 / 5 | 65 / 1 | 30 / 2 | 30 / 2 | 50 / 1 | 35.7 / 4.26 | 30 / 2 |
+
+The joint target is `default_joint_pos + action * scale`. `effort_limit`
+only clips the MuJoCo torque and sets the default `scale =
+0.25 * effort_limit / Kp`, but that default ties the action mapping to `Kp`:
+
+- `k1_walk` uses a flat `scale = 0.25` and a crouched default pose
+  (hip pitch -0.15, knee 0.3, ankle pitch -0.15, shoulder pitch 0.2, elbow
+  yaw ±0.5). Effort limits
+  6 (head), 14 (arms), 30 / 20 / 15 / 35 / 24 / 15 (hip pitch, hip roll,
+  hip yaw, knee, ankle pitch, ankle roll).
+- `k1_mj2` and `k1_fight` derive `scale` from the gains above at start-up
+  (effort limits 6 / 14 / 30, 35, 20, 40, 20, 20 for `k1_mj2`; 4 / 12 / same
+  legs for `k1_fight`), so changing their `Kp` also changes what the policy
+  commands. Set `policy.fixed_action_scale` to the current values first if
+  you only want to retune the motors.
+- `k1_bm154_*` pins the training default pose (hip pitch -0.2, knee 0.4,
+  ankle pitch -0.25, shoulder pitch 0.2, elbow yaw ±0.5), the official
+  effort limits (6 / 14 / 68, 43, 38.3, 112, 38.3, 38.3) and
+  `fixed_action_scale`, so the mapping stays the training one whatever
+  `Kp`/`Kd` are set to.
+- `k1_bt_*` pins `fixed_action_scale` the same way; its gains are the
+  booster_train actuator model (`Kp = J (2 pi f)^2`, `Kd = 2 zeta J 2 pi f`,
+  4 Hz legs, 10 Hz arms and head) with effort limits
+  6 / 14 / 68, 76, 38.3, 112, 38.3, 38.3.
+- `k1_bt2_*` is the same actuator model retrained with the `k1_mj2` gains
+  (`BOOSTER_K1_MJ2_CFG` in our booster_train branch), so the motors get the
+  same Kp/Kd as Booster's own dances while the policy saw booster_train's
+  delays and torque limits. Same effort limits as `k1_bt_*`, hence a
+  different pinned action scale than `k1_mj2` (for example 0.35 on the knee
+  instead of 0.125).
+
+The values come from `booster_deploy/robots/k1.py`,
+`tasks/locomotion/robots/k1/__init__.py`,
+`tasks/beyond_mimic/robots/k1/__init__.py` and
+`tasks/bm154/robots/k1/__init__.py`; those files are authoritative if this
+table drifts.
 
 ### BM154 motion tracking (K1)
 
@@ -136,10 +225,16 @@ python scripts/booster_train_pipeline.py deploy \
     --run <booster_train>/logs/rsl_rl/k1_dance_floss_stmr/<run> --name dance_floss_stmr
 ```
 
-Step 3 prints the `register_booster_train_dance(...)` line to add to
-`tasks/beyond_mimic/robots/k1/__init__.py`; the deploy task then uses the
-`BeyondMimicPolicy` observation with the gains Booster deploys its K1 dances
-with. Our booster_train checkout carries a branch that renames its K1 config to
+Step 3 exports the run's latest checkpoint as `models/<motion>_bt.pt` and
+copies `motions/<motion>.npz`, where `<motion>` is the motion file recorded in
+the run's `params/env.yaml` (override with `--motion`). It prints the
+`register_booster_train_dance("k1_bt_<name>", "<motion>")` line; add it, or
+an entry, to `BOOSTER_TRAIN_TASKS` in `tasks/beyond_mimic/robots/k1/__init__.py`.
+Runs trained on the `-Mj2-v0` task variants (the `k1_mj2` gains) are exported
+with `--gains mj2`, which writes `models/<motion>_mj2_bt.pt` and prints the
+`K1BoosterTrainMj2ControllerCfg` registration for `BOOSTER_TRAIN_MJ2_TASKS`.
+The task then uses the `BeyondMimicPolicy` observation with the booster_train
+actuator-model gains (see [K1 deployment policies](#k1-deployment-policies)). Our booster_train checkout carries a branch that renames its K1 config to
 the official `booster_assets` names and adds an Isaac Lab 2.1 shim.
 
 ### Run Sim2Sim (MuJoCo)
@@ -209,11 +304,14 @@ python scripts/deploy.py --task k1_bm154_jamesbrown --sim --monitor
 
 Then drive the state machine from terminal 2 exactly as on the robot (`x`,
 `r`, `n`, `b`), or from the monitor window (below). The simulated robot starts
-in Walking mode holding the prepare pose with the prepare gains;
-Damping mode only damps the joints; Custom mode applies the latest
+in Walking mode holding the prepare pose with the prepare gains (the deploy
+starts in `IDLE`); `--initial-mode damping` starts it limp on the floor like
+a robot that has just booted, so `x` goes through the get-up. Prepare and
+Walking mode are the same standing hold: Booster's built-in locomotion
+controller is not emulated. Damping mode only damps the joints; Custom mode
+applies the latest
 `/joint_ctrl` command, and commands received before the switch are retained
-as on the robot. Booster's built-in locomotion controller is not emulated, so
-Walking mode is a standing hold. Useful options: `--state-rate` (default
+as on the robot. Useful options: `--state-rate` (default
 500 Hz), `--physics-dt`, `--rtf` to slow the simulation down, and
 `--log-states <file>` to record `time/qpos/qvel/ctrl/mode` for offline checks.
 Get-up is not simulated: the get-up RPC puts the robot back upright in the
@@ -290,6 +388,213 @@ that nothing answers within 2 s is reported as `NO RESPONSE`, which means no
    python scripts/deploy.py --task <TASK_NAME>
    ```
 
+#### Running from the workstation over an Ethernet cable
+
+> **Added in this branch.** `scripts/robot_link.sh`, `booster_link_check`
+> and this way of running are among the features added on this branch (see
+> [What's new in this branch](#whats-new-in-this-branch)).
+
+The deploy does not have to run on the robot. With the workstation plugged
+into the robot through a USB Ethernet adapter, the real-robot code path can
+run here and reach the robot's ROS 2 bridge over the cable, the way
+crl-humanoid-ros (the CRL lab's GitLab, `crl/crl-humanoid-ros`) drives
+a Unitree G1 from a laptop: its hardware node, state machine and monitor all
+run on the laptop, bound to the adapter, and only the low-level loop crosses
+the cable. Both ways of running below use the same link setup; pick per
+session.
+
+| | Everything on the workstation ("crl way") | Deploy on the robot, monitor here (the sequence above) |
+|---|---|---|
+| `deploy.py` runs on | the workstation | the robot (SSH) |
+| `monitor.py` runs on | the workstation, talks to the deploy on this host | the workstation, talks to the deploy over the cable |
+| Crosses the cable | `/low_state` 500 Hz, `/joint_ctrl` 50 Hz, the mode-switch RPC, odometry | `/low_state`, `/joint_ctrl` and odometry for display, `booster_deploy/fsm_*` requests and verdicts |
+| A cable fault costs | the control loop (see [Failure behaviour](#failure-behaviour-and-safety)) | the picture and the monitor's buttons; the controller is unaffected |
+| Files on the robot | none; policies and motions stay here | the repo with the task's checkpoint and motion |
+| Use it for | iterating on policies, workstation inference, no copying | anything where the loop must not depend on the cable |
+
+##### Prerequisites
+
+- ROS 2 Humble and the `booster_interface` workspace on the workstation, as
+  for [software-in-the-loop](#software-in-the-loop-the-real-robot-path-against-a-simulated-robot);
+  `scripts/robot_link.sh` sources `~/stmr/booster_ros2_ws` by default
+  (override with `BOOSTER_ROS2_WS`).
+- Fast DDS on both sides. It is the Humble default and what Booster's ROS 2
+  image ships; leave `RMW_IMPLEMENTATION` alone on the robot. Two different
+  middlewares never discover each other.
+- The robot's ROS domain. The robot's bridge publishes on whatever
+  `ROS_DOMAIN_ID` its setup script sets, 0 if none; check with
+  `env | grep ROS` in an SSH session on the robot. The link script takes it
+  as its second argument.
+- A USB Ethernet adapter with a static IPv4 address on the robot's subnet.
+  The adapter's interface is named after its MAC (`enx...`); `ip -brief
+  addr` lists it once it is plugged in. For example, with the robot at
+  `192.168.10.102`:
+
+  ```bash
+  sudo ip addr add 192.168.10.5/24 dev enx00e04c680123
+  sudo ip link set enx00e04c680123 up
+  ping -c 2 192.168.10.102
+  ```
+
+  (or the same through NetworkManager: `nmcli con add type ethernet ifname
+  enx00e04c680123 ip4 192.168.10.5/24`).
+
+##### Step 1: source the link
+
+```bash
+cd ~/stmr/booster_deploy
+source scripts/robot_link.sh enx00e04c680123 0      # interface name or its IPv4, then the robot's domain
+```
+
+Sourcing (not running) the script in the shell you will work from does, in
+order:
+
+1. resolves the interface name to its IPv4 address and refuses if it has
+   none, which usually means the adapter is unplugged or unconfigured;
+2. sources `/opt/ros/humble/setup.bash`, the `booster_interface` workspace
+   and `.venv/bin/activate`;
+3. writes `logs/fastdds_link.xml`, a Fast DDS profile with a single UDPv4
+   transport whose interface whitelist is that one address and with the
+   built-in transports disabled, and exports
+   `FASTRTPS_DEFAULT_PROFILES_FILE` so every ROS 2 node started from this
+   shell uses it;
+4. exports `RMW_IMPLEMENTATION=rmw_fastrtps_cpp` and `ROS_DOMAIN_ID`, and
+   unsets `ROS_LOCALHOST_ONLY`;
+5. defines the `booster_link_check` shell function.
+
+The pinning matters because a workstation typically has several interfaces
+(WiFi, a VPN, Docker and libvirt bridges). Fast DDS advertises on all of
+them by default, and discovery or traffic can end up on the wrong one, which
+shows as a link that works intermittently. With the profile, nothing leaves
+the adapter. The generated file looks like this:
+
+```xml
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>link_udp</transport_id>
+            <type>UDPv4</type>
+            <interfaceWhiteList>
+                <address>192.168.10.5</address>
+            </interfaceWhiteList>
+        </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="link_participant" is_default_profile="true">
+        <rtps>
+            <userTransports><transport_id>link_udp</transport_id></userTransports>
+            <useBuiltinTransports>false</useBuiltinTransports>
+        </rtps>
+    </participant>
+</profiles>
+```
+
+Note the spelling `interfaceWhiteList`, capital L. Fast DDS 2.6 rejects
+`interfaceWhitelist` with `XMLPARSER Error` lines at node start-up and then
+runs unpinned, so a wrong profile fails open rather than closed. Everything
+the script sets is per shell: open a new terminal to get the normal
+environment back.
+
+##### Step 2: check the link
+
+```bash
+booster_link_check
+```
+
+listens for five seconds and expects two things: `/low_state` at about
+500 Hz and the `booster_rpc_service` service. Success looks like
+
+```text
+domain 0, interface 192.168.10.5; listening 5 s for /low_state ...
+  /low_state: average rate: 499.995
+  booster_rpc_service: available
+link ok
+```
+
+`nothing received` means DDS discovery did not happen: the cable, the
+adapter's address, the subnet, the domain or the middleware. Fix that before
+starting anything; nothing below can work without it. Topics visible but no
+RPC service means the robot's bridge is only partly up.
+
+##### Step 3a: everything on the workstation
+
+```bash
+python scripts/deploy.py --task k1_bt_dance_floss_stmr --monitor
+```
+
+This is the same command as against the simulated robot minus `--sim`: the
+deploy subscribes to the robot's `/low_state`, publishes `/joint_ctrl`, does
+the mode switches through the RPC service, and starts `scripts/monitor.py`
+next to itself (output in `logs/monitor.log`; `--monitor-args=` passes
+options through, `--exit-mode damping` overrides the task's exit mode). The
+state machine prints its state and the keys that act on it; drive it from
+this terminal (`x`, `r`, `n`, `b`), from the monitor's FSM panel or from the
+gamepad, exactly as described under
+[Deployment state machine](#deployment-state-machine). Ctrl+C hands the
+robot back per the exit mode and stops the monitor.
+
+Never run this while a deploy is also running on the robot: two publishers
+on `/joint_ctrl` fight over the motors.
+
+##### Step 3b: deploy on the robot, monitor here
+
+Start the deploy on the robot over SSH as in the sequence above, then in the
+sourced shell here:
+
+```bash
+python scripts/monitor.py --robot k1
+```
+
+The monitor shows the measured pose and the deployment's state, and its FSM
+panel requests transitions on `booster_deploy/fsm_request`; the deploy on
+the robot validates each request like a key press, performs the RPCs and
+answers on `booster_deploy/fsm_result`, which the panel shows for a few
+seconds (`NO RESPONSE` after two seconds means the request never reached a
+deploy). The control loop never touches the cable.
+
+##### Failure behaviour and safety
+
+With everything on the workstation, the 50 Hz loop depends on the cable and
+on DDS. If `/low_state` stops arriving, the deploy has no staleness guard: the
+executor keeps stepping the policy on the last state it received and keeps
+publishing `/joint_ctrl`, and the mode watchdog, whose `GetStatus` call then
+fails, simply skips that check. What the firmware does when commands stop
+reaching it in Custom mode is Booster's behaviour, not ours. So for this way:
+
+- keep the physical remote in hand; its B button is the emergency stop that
+  does not depend on the cable. The monitor's ESTOP is a network message;
+- use a short, directly attached cable and the pinned profile, not a switch
+  shared with other traffic;
+- prefer the deploy-on-robot way for anything that matters more than
+  convenience. That is why both are documented.
+
+In the deploy-on-robot way a cable fault costs only the monitor: its status
+line stops updating and its buttons get `NO RESPONSE`, while the deploy on
+the robot continues with its keyboard and gamepad.
+
+##### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `booster_link_check`: `nothing received` | Discovery failed. `ping` the robot; check `ip -4 addr show dev <adapter>` has an address on the robot's subnet; match `ROS_DOMAIN_ID` to the robot's; make sure `RMW_IMPLEMENTATION` is unset or Fast DDS on the robot; check the robot's setup does not export `ROS_LOCALHOST_ONLY=1`. |
+| `XMLPARSER Error` lines when a node starts | The profile did not parse; the node runs unpinned. Regenerate it by sourcing the script again, and keep the `interfaceWhiteList` spelling if you edit it by hand. |
+| Topics listed but `booster_rpc_service` missing | The bridge on the robot is not fully up. Restart it on the robot, then re-check. |
+| Link works, then flaps | Another interface took part in discovery. Confirm the profile is in effect: `echo $FASTRTPS_DEFAULT_PROFILES_FILE`, and start every node from the sourced shell. |
+| Monitor shows `NO RESPONSE` | No deploy answered on this domain: it is not running, runs on another domain, or (deploy-on-robot way) the cable is down. |
+| Deploy prints `Waiting for first '/low_state' message` forever | Same as the first row; the deploy waits and never starts publishing without state. |
+| Monitor window empty, only a status line | `--no-viewer`, or no display. The status line carries the same information. |
+
+##### How this was verified
+
+`logs/sil_check/run_link_sil.sh` (gitignored, on the workstation) runs the
+whole crl way against the simulated robot with the link pinned to a real
+interface of this machine: sources the script, starts `sim_robot.py`, runs
+`booster_link_check`, then `deploy.py --task k1_bt_dance_floss_stmr
+--monitor` and drives `IDLE -> STAND -> WALK -> TASK` through the remote
+control path. With the profile pinned to an address the machine does not
+have, the same check finds nothing, which shows the pin is in effect and not
+just declared. It has not yet been run against the real robot; the robot's
+domain and subnet are the two things to confirm on the day.
+
 #### PD damping (`Kd`) on the real robot
 
 For parallel-actuated joints, `robot.joint_damping` is sent directly to the
@@ -331,42 +636,60 @@ The value `"walk"` is also accepted as an alias for `"walking"` in Python config
 #### Deployment state machine
 
 On the real robot, `deploy.py` runs a finite state machine
-(`booster_deploy/fsm`). Only the listed transitions are accepted; anything
-else is refused and logged. The current state and the buttons that act on it
-are printed at every change.
+(`booster_deploy/fsm`). The states outside Custom mode are the firmware's
+own modes, so X and Y follow the same Damping -> Prepare sequence as
+Booster's remote; Custom mode is entered only for our policies. Only the
+listed transitions are accepted; anything else is refused and logged. The
+current state and the buttons that act on it are printed at every change.
 
 | State | Robot mode | What runs |
 |-------|------------|-----------|
-| `IDLE` | Walking (Booster's own controller) | nothing published; start state |
-| `STAND` | Custom | PD hold of `robot.prepare_state` (1 s interpolation on entry) |
-| `WALK` | Custom | the robot's locomotion policy with stick commands |
+| `IDLE` | Damping (or Walking after a get-up / `exit_mode="walking"`) | the firmware; nothing published; start state |
+| `STAND` | Prepare | the firmware's standing controller |
+| `WALK` | Custom | the robot's locomotion policy (`tasks/locomotion`) with stick commands |
 | `TASK` | Custom | the policy selected with `--task` |
-| `ESTOP` | Damping | robot goes limp; nothing published |
+| `ESTOP` | Damping | robot goes limp after an abort; nothing published |
 
 ```text
 IDLE --X--> STAND --A--> WALK --A--> TASK        Y steps back one state
 any --B--> ESTOP --Y--> IDLE                      Ctrl+C: exit_mode, then quit
 ```
 
+- The deploy starts in the state matching the robot's mode (Damping or
+  Walking -> `IDLE`, Prepare -> `STAND`; Custom under another controller ->
+  `IDLE`, publishing nothing).
 - `robot.prepare_mode` decides where `A` goes from `STAND`: `"walking"`
   (default) inserts the `WALK` state (`STAND -> WALK -> TASK`), `"standing"`
-  goes straight to `TASK`.
-- Entering `STAND` from `IDLE` checks the posture, primes a hold of the
-  current pose with the `prepare_state` gains and switches the firmware to
-  Custom mode. An unsafe posture switches to Damping instead (`ESTOP`).
+  goes straight to `TASK`. `WALK` exists only when the robot has a
+  locomotion task (`k1_walk`, `t1_walk`, `t2_walk`) and the task launched is
+  not that policy itself.
+- `IDLE -> STAND` switches the firmware to Prepare mode. When the robot is
+  not upright it first runs Booster's built-in get-up (`GetUpWithMode`,
+  `booster.getup_version` 0 = V1, 1 = V2 on K1), which ends in Walking mode,
+  and requests Prepare after. `STAND -> IDLE` switches to Damping: the robot
+  goes limp, as at the end of Booster's own sequence, so hold it.
+- Entering Custom mode (`STAND -> WALK` or `STAND -> TASK`) checks the
+  posture, primes a hold of the current pose with the `prepare_state` gains
+  and switches the firmware to Custom mode; the policy then publishes
+  `/joint_ctrl`. An unsafe posture switches to Damping instead (`ESTOP`).
+  `WALK <-> TASK` only switches the policy. Leaving Custom mode stops the
+  policy first and then switches the firmware to the target's mode; if the
+  firmware refuses, the next mode is tried (Prepare <-> Walking, then
+  Damping) and the verdict names the state reached.
+- The velocity command is zeroed when `WALK` is entered, so a keyboard
+  velocity left over from before does not make the robot walk off.
 - A policy's safety fallback moves to `ESTOP`; a policy that finishes (for
   example a motion with `stop_at_motion_end`) moves to `booster.after_task`
   (`"stand"` by default, or `"walk"`).
-- `Ctrl+C` hands the robot back (`booster.exit_mode`: `"walking"` -> `IDLE`,
-  `"damping"` -> `ESTOP`) and exits.
+- `Ctrl+C` hands the robot back from `WALK` or `TASK` (`booster.exit_mode`:
+  `"walking"` -> Walking mode, `"damping"` -> Damping mode) and exits; in
+  `STAND` the firmware already controls the robot and is left as it is.
 - A mode watchdog polls `GetStatus` every `booster.mode_check_period_s`
-  (1 s) while a Custom state is active. If the firmware left Custom mode on
-  its own (fall protection, restart, the operator app; or a restarted
-  simulator), the deploy stops publishing and follows the robot to `IDLE` or
-  `ESTOP` instead of driving a ghost.
-- `ESTOP -> IDLE` on a robot that is not upright uses Booster's built-in
-  get-up (`GetUpWithMode`, `booster.getup_version` 0 = V1, 1 = V2 on K1) and
-  waits until the robot reports Walking mode.
+  (1 s). If the firmware changed mode on its own (fall protection, a
+  restart, the operator app or the Booster remote; or a restarted
+  simulator), the deploy follows it: Prepare -> `STAND`, Walking -> `IDLE`,
+  Damping -> `ESTOP`, Custom under another controller -> `IDLE`; the policy
+  stops publishing if it was.
 - Transitions can also be requested by name on the `booster_deploy/fsm_request`
   topic (`std_msgs/String`, used by the monitor). The current state is
   published latched on `booster_deploy/fsm_state`, and every request (topic,
@@ -391,8 +714,9 @@ any --B--> ESTOP --Y--> IDLE                      Ctrl+C: exit_mode, then quit
 > | `REJECTED <state>: not allowed from <current>` | not in the transition table |
 > | `REJECTED <name>: unknown state` | topic request with a name that is not a state |
 > | `IGNORED <state>: already the current state` | topic request for the current state |
-> | `FAILED STAND: unsafe posture, switched to Damping` | posture check failed on `IDLE -> STAND`; the robot is in `ESTOP` |
-> | `FAILED <state>: <current> -> <state> failed` | the mode RPC, get-up or executor hand-over failed |
+> | `REJECTED WALK: no locomotion policy for this robot` | the robot has no locomotion task, or the task launched is that policy |
+> | `FAILED <WALK or TASK>: unsafe posture, switched to Damping` | posture check failed on entering Custom mode; the robot is in `ESTOP` |
+> | `FAILED <state>: <current> -> <state> failed[, robot is in <other>]` | the mode RPC, get-up or executor hand-over failed; a fallback mode may have been reached |
 
 The same flow can be exercised without hardware with the simulated robot
 (see below).
