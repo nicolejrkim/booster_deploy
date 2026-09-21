@@ -5,8 +5,8 @@ import signal
 import time
 import threading
 import multiprocessing as mp
-from copy import deepcopy
 from multiprocessing import synchronize
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -21,12 +21,27 @@ from std_msgs.msg import String
 
 
 class _RobotModeInt:
-    """Mode values used by the Booster Loco RPC API."""
+    """Mode values used by the Booster Loco RPC API (``RobotMode``)."""
 
     kDamping = 0
+    kPrepare = 1
     kWalking = 2
     kCustom = 3
 
+
+_MODE_VALUES = {
+    "damping": _RobotModeInt.kDamping,
+    "prepare": _RobotModeInt.kPrepare,
+    "walking": _RobotModeInt.kWalking,
+    "walk": _RobotModeInt.kWalking,
+    "custom": _RobotModeInt.kCustom,
+}
+_MODE_NAMES = {
+    _RobotModeInt.kDamping: "Damping",
+    _RobotModeInt.kPrepare: "Prepare",
+    _RobotModeInt.kWalking: "Walking",
+    _RobotModeInt.kCustom: "Custom",
+}
 
 _LOC_API_CHANGE_MODE = 2000
 _LOC_API_GET_STATUS = 2018
@@ -64,8 +79,6 @@ class BoosterRobotPortal:
         self.remoteControlService = RemoteControlService()
         # Use multiprocessing.Event for inter-process communication
         self.exit_event = mp.Event()
-        self.velocity_commands_enabled_event = mp.Event()
-        self.task_start_event = mp.Event()
         self.low_state_received_event = threading.Event()
         # Deployment state machine (see booster_deploy.fsm): the portal
         # requests states, the executor process acknowledges the active one
@@ -75,6 +88,9 @@ class BoosterRobotPortal:
         self.fsm_executor_request = mp.Value("i", -1)
         self._fsm = None
         self._fsm_walk_first = False
+        # Robot mode last seen by the mode watchdog, to log changes once.
+        self._seen_mode: int | None = None
+        self._walk_available = False
         # State requested over the booster_deploy/fsm_request topic (monitor,
         # `ros2 topic pub`), consumed by the supervisor loop.
         self._fsm_topic_request: str | None = None
@@ -281,7 +297,8 @@ class BoosterRobotPortal:
             self._fsm_topic_request = msg.data.strip().upper()
 
     def _get_up(self) -> bool:
-        """Booster's built-in get-up into Walking mode (blocking, polled)."""
+        """Booster's built-in get-up (blocking, polled).  The firmware gets
+        up into Walking mode; the caller requests the mode it wants after."""
         version = int(self.cfg.booster.getup_version)
         self.logger.info("Requesting get-up (version %d)...", version)
         ok, _ = self._call_booster_rpc(
@@ -413,28 +430,21 @@ class BoosterRobotPortal:
         return True, parsed
 
     def _change_robot_mode(self, mode_name: str) -> bool:
-        mode_values = {
-            "damping": _RobotModeInt.kDamping,
-            "walking": _RobotModeInt.kWalking,
-            "walk": _RobotModeInt.kWalking,
-            "custom": _RobotModeInt.kCustom,
-        }
+        """ChangeMode RPC ("damping", "prepare", "walking" or "custom"),
+        confirmed with GetStatus."""
         normalized = mode_name.strip().lower()
-        if normalized not in mode_values:
+        if normalized not in _MODE_VALUES:
             raise ValueError(
-                f"Unsupported robot mode {mode_name!r}; "
-                "expected 'damping', 'walking' (or 'walk'), or 'custom'"
+                f"Unsupported robot mode {mode_name!r}; expected "
+                "'damping', 'prepare', 'walking' (or 'walk'), or 'custom'"
             )
 
         if not self.rpc_service_client.wait_for_service(timeout_sec=15.0):
             self.logger.error("booster_rpc_service is unavailable")
             return False
 
-        expected_mode = mode_values[normalized]
-        display_name = (
-            "Walking" if expected_mode == _RobotModeInt.kWalking
-            else normalized.capitalize()
-        )
+        expected_mode = _MODE_VALUES[normalized]
+        display_name = _MODE_NAMES[expected_mode]
         for _ in range(20):
             ok, _ = self._call_booster_rpc(
                 _LOC_API_CHANGE_MODE,
@@ -469,170 +479,6 @@ class BoosterRobotPortal:
         # The low-level controller keeps this command when Custom is entered,
         # until the locomotion policy publishes its first action.
         self.low_cmd_publisher.publish(self.low_cmd)
-
-    def start_custom_mode_conditionally(self):
-        print(f"{self.remoteControlService.get_custom_mode_operation_hint()}")
-        while not self.exit_event.is_set():
-            if self.remoteControlService.start_custom_mode():
-                break
-            time.sleep(0.1)
-
-        if self.exit_event.is_set():
-            return False
-
-        while (
-            rclpy.ok()
-            and not self.exit_event.is_set()
-            and not self.low_state_received_event.wait(timeout=0.5)
-        ):
-            self.logger.info("Waiting for first '/low_state' message")
-
-        if not self.low_state_received_event.is_set():
-            self.logger.error("No valid '/low_state'; refusing Custom mode")
-            return False
-
-        # Python-side walking preparation is allowed only from an upright
-        # posture.  This is a single check at the X trigger; interpolation
-        # itself intentionally has no additional posture checks.
-        if self.cfg.robot.prepare_mode.strip().lower() == "walking":
-            state = self.synced_state.read()[0]
-            rpy = torch.from_numpy(state["root_rpy_w"]).to(dtype=torch.float32)
-            projected_gravity = lab_math.quat_apply_inverse(
-                lab_math.quat_from_euler_xyz(*rpy).squeeze(),
-                torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32),
-            )
-            if projected_gravity[2] > -0.5:
-                self.logger.error(
-                    "Refusing walk preparation: robot posture is unsafe "
-                    "(projected_gravity[2]=%.3f). Switching to damping mode.",
-                    float(projected_gravity[2]),
-                )
-                self._safety_abort = True
-                self._change_robot_mode("damping")
-                return False
-
-            while rclpy.ok() and self.low_cmd_publisher.get_subscription_count() == 0:
-                self.logger.info("Waiting for '/joint_ctrl' subscriber, retry in 0.5s")
-                time.sleep(0.5)
-
-            # Match standing preparation's hold position and PVT-style PD
-            # gains.  Locomotion takes over only after Custom is entered.
-            # Send exactly one command while PVT still owns the robot; the
-            # low-level controller retains it across the Custom transition.
-            self._prime_custom_command()
-            # Give the low-level/PVT path time to receive and retain the
-            # non-zero-gain hold command before relinquishing control.
-            time.sleep(0.1)
-
-            # The Python locomotion policy publishes joint_ctrl commands.  The
-            # robot must be in Custom mode for those commands to be accepted;
-            # merely starting the inference process leaves a robot that was in
-            # PVT mode under the previous controller.
-            if not self._change_robot_mode("custom"):
-                self.logger.error(
-                    "Failed to switch to Custom mode for walking preparation"
-                )
-                return False
-
-            # Walking preparation uses the Python locomotion policy directly;
-            # do not run the PVT interpolation.
-            self.logger.info(
-                "Walking preparation accepted; starting zero-command locomotion"
-            )
-            return True
-
-        while rclpy.ok() and self.low_cmd_publisher.get_subscription_count() == 0:
-            self.logger.info("Waiting for '/joint_ctrl' subscriber, retry in 0.5s")
-            time.sleep(0.5)
-
-        self.logger.info("Subscriber found, starting control loop")        
-
-        prepare_state = self.robot.cfg.prepare_state
-        init_joint_pos = self.synced_state.read()[0]['joint_pos']
-        for i in range(self.robot.num_joints):
-            self.motor_cmd[i].q = init_joint_pos[i]
-            self.motor_cmd[i].kp = float(prepare_state.stiffness[i])
-            self.motor_cmd[i].kd = float(prepare_state.damping[i])
-
-        self.low_cmd_publisher.publish(self.low_cmd)
-        time.sleep(0.1)
-
-        if not self._change_robot_mode("custom"):
-            self.logger.error("Failed to switch to Custom mode")
-            return False
-
-        trans = np.linspace(init_joint_pos, prepare_state.joint_pos, num=500)
-        start_time = time.perf_counter()
-        for i in range(500):
-            for j in range(self.robot.num_joints):
-                self.motor_cmd[j].q = trans[i][j]
-            self.low_cmd_publisher.publish(self.low_cmd)
-            while time.perf_counter() < start_time + (i + 1) * 0.002:
-                time.sleep(0.0002)
-        if self.cfg.robot.prepare_mode.strip().lower() == "walking":
-            self.logger.info(
-                "Prepare pose reached; starting Python RL walking with zero commands"
-            )
-        self.logger.info("Custom mode started, initialized with prepare pose")
-        return True
-
-    def _build_prepare_cfg(self):
-        """Build the matching robot locomotion config for walking preparation."""
-        robot_name = self.cfg.robot.name.lower()
-        if "t2" in robot_name:
-            from tasks.locomotion.robots.t2 import T2WalkTaskCfg
-            walk_cfg = T2WalkTaskCfg()
-        elif "t1" in robot_name:
-            from tasks.locomotion.robots.t1 import T1WalkControllerCfg1
-            walk_cfg = T1WalkControllerCfg1()
-        elif "k1" in robot_name:
-            from tasks.locomotion.robots.k1 import K1WalkTaskCfg
-            walk_cfg = K1WalkTaskCfg()
-        else:
-            raise RuntimeError(f"No locomotion preparation policy for robot {self.cfg.robot.name!r}")
-        prepare_cfg = deepcopy(self.cfg)
-        # The hand-off command and the prepare controller must use the
-        # matching locomotion robot gains, not gains inherited from a task
-        # policy that happens to run on the same robot.
-        prepare_cfg.robot = deepcopy(walk_cfg.robot)
-        prepare_cfg.policy = deepcopy(walk_cfg.policy)
-        prepare_cfg.vel_command = deepcopy(walk_cfg.vel_command)
-        prepare_cfg.robot.prepare_mode = "walking"
-        return prepare_cfg
-
-    def start_rl_gait_conditionally(self, wait_for_trigger: bool = True):
-        """Start RL mode and spawn inference process and publisher thread."""
-        if wait_for_trigger:
-            print(f"{self.remoteControlService.get_rl_gait_operation_hint()}")
-            while not self.exit_event.is_set():
-                if self.remoteControlService.start_rl_gait():
-                    break
-                time.sleep(0.1)
-
-        if self.exit_event.is_set():
-            return False
-
-        # In walking preparation, start the matching zero-command locomotion
-        # policy immediately; the child switches to the task policy after A/r.
-        process_cfg = self.cfg
-        prepare_then_task = (
-            self.cfg.robot.prepare_mode.strip().lower() == "walking"
-        )
-        if prepare_then_task:
-            process_cfg = self._build_prepare_cfg()
-        self.inference_process = mp.Process(
-            target=BoosterRobotPortal.inference_process_func,
-            args=(process_cfg, self, prepare_then_task),
-            daemon=True,
-        )
-        self.inference_process.start()
-        self.logger.info("Inference process started")
-
-        # In walking preparation the locomotion policy is command-free, so do
-        # not advertise velocity controls until the task policy is enabled.
-        if not prepare_then_task and self.cfg.vel_command is not None:
-            print(f"{self.remoteControlService.get_operation_hint()}")
-        return True
 
     def cleanup(self) -> None:
         """Clean up resources (idempotent)."""
@@ -743,15 +589,29 @@ class BoosterRobotPortal:
         return "ok"
 
     def _build_walk_cfg(self):
-        """Locomotion config for the WALK state, or None if the task is it."""
-        try:
-            walk_cfg = self._build_prepare_cfg()
-        except RuntimeError as exc:
-            self.logger.warning("No WALK state: %s", exc)
+        """Config of the WALK state: the robot's locomotion policy from
+        ``tasks/locomotion`` with its own gains and stick limits, or None
+        when the robot has none or the task itself is that policy."""
+        robot_name = self.cfg.robot.name.lower()
+        if "t2" in robot_name:
+            from tasks.locomotion.robots.t2 import T2WalkTaskCfg
+            walk = T2WalkTaskCfg()
+        elif "t1" in robot_name:
+            from tasks.locomotion.robots.t1 import T1WalkControllerCfg1
+            walk = T1WalkControllerCfg1()
+        elif "k1" in robot_name:
+            from tasks.locomotion.robots.k1 import K1WalkTaskCfg
+            walk = K1WalkTaskCfg()
+        else:
+            self.logger.warning("No WALK state: no locomotion policy for "
+                                "robot %r", self.cfg.robot.name)
             return None
-        if (walk_cfg.policy.checkpoint_path
-                == self.cfg.policy.checkpoint_path):
+        if walk.policy.checkpoint_path == self.cfg.policy.checkpoint_path:
             return None
+        walk_cfg = deepcopy(self.cfg)
+        walk_cfg.robot = deepcopy(walk.robot)
+        walk_cfg.policy = deepcopy(walk.policy)
+        walk_cfg.vel_command = deepcopy(walk.vel_command)
         return walk_cfg
 
     def _fsm_request(self, target: str, wait_ack: bool = True,
@@ -773,8 +633,11 @@ class BoosterRobotPortal:
         return False
 
     def fsm_transition(self, target: str) -> bool:
-        """Perform a validated state transition (mode RPCs + executor)."""
-        from ..fsm import ESTOP, IDLE, STAND
+        """Perform a validated state transition: hand the executor over and
+        switch the firmware to the state's mode (``fsm.ROBOT_MODE``)."""
+        from ..fsm import (
+            CUSTOM_STATES, ESTOP, IDLE, ROBOT_MODE, STAND, WALK,
+        )
         fsm = self._fsm
         if not fsm.can(target):
             self.logger.warning(
@@ -783,12 +646,23 @@ class BoosterRobotPortal:
             self._fsm_publish_result(
                 "REJECTED", target, f"not allowed from {fsm.current}")
             return False
+        if target == WALK and not self._walk_available:
+            self.logger.warning("No locomotion policy: WALK is not available")
+            self._fsm_publish_result(
+                "REJECTED", target, "no locomotion policy for this robot")
+            return False
         current = fsm.current
-        ok = True
-        if current == IDLE and target == STAND:
+        if target == WALK:
+            # A latched keyboard velocity must not make the robot walk off.
+            self.remoteControlService.reset_velocity()
+        reached = target
+        if target in CUSTOM_STATES and current not in CUSTOM_STATES:
+            # STAND -> WALK / TASK: prime a hold, enter Custom mode, then
+            # the executor starts the policy.
             status = self._enter_custom_mode()
             if status == "unsafe":
-                self.logger.error("Refusing STAND; switching to Damping mode")
+                self.logger.error("Refusing %s; switching to Damping mode",
+                                  target)
                 self._safety_abort = True
                 self._fsm_request(ESTOP, wait_ack=False)
                 self._change_robot_mode("damping")
@@ -797,33 +671,73 @@ class BoosterRobotPortal:
                 self._fsm_publish_result(
                     "FAILED", target, "unsafe posture, switched to Damping")
                 return False
-            ok = status == "ok" and self._fsm_request(STAND)
-            if not ok:
-                self._change_robot_mode("walking")
+            if status != "ok":
+                reached = None
+            elif not self._fsm_request(target):
+                # Custom mode holds the primed pose; give the robot back.
+                self._fsm_request(current, wait_ack=False)
+                reached = self._hand_back(ROBOT_MODE[current])
+        elif target in CUSTOM_STATES:
+            # WALK <-> TASK: a policy switch in Custom mode.
+            if not self._fsm_request(target):
+                reached = None
         elif target == ESTOP:
-            # The executor publishes one damping command and stops publishing
-            # before the firmware leaves Custom mode.
+            # The executor publishes one damping command and stops
+            # publishing before the firmware leaves Custom mode.
             self._fsm_request(ESTOP)
-            ok = self._change_robot_mode("damping")
-        elif target == IDLE:
+            reached = self._hand_back("damping")
+        elif current in CUSTOM_STATES:
+            # The executor stops publishing first; the firmware keeps the
+            # last command until it has switched.
+            self._fsm_request(target)
+            reached = self._hand_back(ROBOT_MODE[target])
+        elif current == ESTOP:
+            # ESTOP -> IDLE: both are Damping mode; nothing to switch.
             self._fsm_request(IDLE)
-            if current == ESTOP and not self._posture_is_upright():
-                # A limp robot is usually on the floor: use the firmware's
-                # get-up, which ends in Walking mode.
-                ok = self._get_up()
-            else:
-                ok = self._change_robot_mode("walking")
+            self._safety_abort = False
         else:
-            ok = self._fsm_request(target)
-        if not ok:
+            self._fsm_request(target)
+            ok = True
+            if (target == STAND and current == IDLE
+                    and not self._posture_is_upright()):
+                # A limp robot is usually on the floor: the firmware's
+                # get-up ends in Walking mode, Prepare is requested after.
+                ok = self._get_up()
+            if not (ok and self._change_robot_mode(ROBOT_MODE[target])):
+                reached = None
+        if reached != target:
             self.logger.error("Transition %s -> %s failed", current, target)
-            self._fsm_publish_result(
-                "FAILED", target, f"{current} -> {target} failed")
+            reason = f"{current} -> {target} failed"
+            if reached is not None and reached != current:
+                fsm.switch(reached)
+                self._fsm_print_state()
+                reason += f", robot is in {reached}"
+            self._fsm_publish_result("FAILED", target, reason)
             return False
         fsm.switch(target)
         self._fsm_print_state()
         self._fsm_publish_result("OK", target)
         return True
+
+    def _hand_back(self, mode: str) -> str | None:
+        """Leave Custom mode for ``mode`` ("prepare", "walking" or
+        "damping").  When the firmware refuses, the next mode in the
+        fallback chain is tried, damping last.  Returns the state reached,
+        or None when every switch failed (the firmware then keeps the last
+        command in Custom mode)."""
+        from ..fsm import ESTOP, IDLE, STAND
+        chains = {
+            "prepare": ("prepare", "walking", "damping"),
+            "walking": ("walking", "prepare", "damping"),
+            "damping": ("damping",),
+        }
+        states = {"prepare": STAND, "walking": IDLE, "damping": ESTOP}
+        for candidate in chains[mode]:
+            if self._change_robot_mode(candidate):
+                return states[candidate]
+            self.logger.error("Switching to %s mode failed",
+                              _MODE_NAMES[_MODE_VALUES[candidate]])
+        return None
 
     def _fsm_publish_result(self, verdict: str, target: str,
                             reason: str = "") -> None:
@@ -857,8 +771,10 @@ class BoosterRobotPortal:
         return None
 
     def _fsm_sync_from_executor(self) -> None:
-        """Apply a transition initiated by the executor (policy stop/finish)."""
-        from ..fsm import ESTOP, state_name
+        """Apply a transition initiated by the executor (policy stop/finish):
+        it has stopped publishing already; switch the firmware to the
+        state's mode."""
+        from ..fsm import ESTOP, ROBOT_MODE, state_name
         index = self.fsm_executor_request.value
         if index < 0:
             return
@@ -868,29 +784,67 @@ class BoosterRobotPortal:
         self.fsm_requested.value = index
         if target == ESTOP:
             self._safety_abort = True
-            self._change_robot_mode("damping")
+        if ROBOT_MODE[target] == "custom":
+            reached = target  # WALK: a policy switch, the mode is unchanged
+        else:
+            reached = self._hand_back(ROBOT_MODE[target])
+        if reached is None:
+            self.logger.error(
+                "Handing the robot back failed; it keeps the last command "
+                "in Custom mode")
+        elif reached != target:
+            self.logger.warning("Robot is in %s instead of %s", reached, target)
+            target = reached
         if self._fsm.current != target:
             self._fsm.switch(target)
             self._fsm_print_state()
 
-    def _fsm_check_robot_mode(self) -> None:
-        """Mode watchdog: the firmware can leave Custom mode on its own (a
-        fall protection, a restart, an operator app).  If it did while a
-        Custom state is active, stop publishing and follow the robot."""
-        from ..fsm import CUSTOM_STATES, ESTOP, IDLE
-        if self._fsm.current not in CUSTOM_STATES:
-            return
+    def _fsm_follow_robot(self, initial: bool = False) -> None:
+        """Mode watchdog: keep the state machine in step with the firmware.
+
+        Every state has a firmware mode (``fsm.ROBOT_MODE``).  The firmware
+        changes mode on its own (fall protection, a restart, the operator
+        app or the Booster remote); the state matching the new mode is then
+        entered without a transition check and the executor stops
+        publishing if it was.  ``initial`` picks the start state.
+        """
+        from ..fsm import CUSTOM_STATES, ESTOP, IDLE, ROBOT_MODE, STAND
         ok, status = self._call_booster_rpc(_LOC_API_GET_STATUS)
         if not ok or status is None:
             return
         mode = int(status.get("current_mode", -1))
-        if mode == _RobotModeInt.kCustom:
+        current = self._fsm.current
+        if mode == _MODE_VALUES[ROBOT_MODE[current]]:
+            self._seen_mode = mode
             return
-        target = ESTOP if mode == _RobotModeInt.kDamping else IDLE
-        self.logger.error(
-            "Robot left Custom mode (current_mode=%d) while in %s; "
-            "commands are being ignored. Switching to %s.",
-            mode, self._fsm.current, target)
+        if mode == _RobotModeInt.kPrepare:
+            target = STAND
+        elif mode == _RobotModeInt.kWalking:
+            target = IDLE  # Booster's own controller
+        elif mode == _RobotModeInt.kDamping:
+            target = IDLE if initial else ESTOP
+        else:
+            # Custom mode under another controller (or ours, after a
+            # crash), Soccer, unknown: hands off.
+            target = IDLE
+        if mode != self._seen_mode:
+            self._seen_mode = mode
+            name = _MODE_NAMES.get(mode, f"mode {mode}")
+            if mode == _RobotModeInt.kCustom and current not in CUSTOM_STATES:
+                self.logger.warning(
+                    "Robot is in Custom mode under another controller; "
+                    "%s publishes nothing (X switches it to Prepare)",
+                    target)
+            elif initial or target == current:
+                self.logger.info("Robot is in %s mode: %s", name, target)
+            else:
+                self.logger.error(
+                    "Robot switched to %s mode on its own while in %s; "
+                    "following to %s", name, current, target)
+        if target == current:
+            return
+        if target != ESTOP:
+            self._safety_abort = False
         self._fsm_request(target)
         self._fsm.switch(target)
         self._fsm_print_state()
@@ -913,7 +867,7 @@ class BoosterRobotPortal:
         States and transitions are described in ``booster_deploy.fsm``.
         """
         from ..fsm import (
-            CUSTOM_STATES, ESTOP, IDLE, STATES, TRANSITIONS, StateMachine,
+            CUSTOM_STATES, IDLE, STATES, TRANSITIONS, StateMachine,
         )
         from ..fsm.executor import fsm_process_func
 
@@ -944,9 +898,10 @@ class BoosterRobotPortal:
             return
 
         walk_cfg = self._build_walk_cfg()
+        self._walk_available = walk_cfg is not None
         self._fsm = StateMachine(STATES, TRANSITIONS, IDLE)
         self._fsm_walk_first = (
-            prepare_mode == "walking" and walk_cfg is not None)
+            prepare_mode == "walking" and self._walk_available)
 
         self.inference_process = mp.Process(
             target=fsm_process_func,
@@ -956,6 +911,8 @@ class BoosterRobotPortal:
         self.inference_process.start()
         self.logger.info("FSM executor process started")
         print(self.remoteControlService.get_fsm_operation_hint())
+        # Start in the state matching the robot's current mode.
+        self._fsm_follow_robot(initial=True)
         self._fsm_print_state()
 
         next_mode_check = time.perf_counter()
@@ -963,7 +920,7 @@ class BoosterRobotPortal:
             self._fsm_sync_from_executor()
             if time.perf_counter() >= next_mode_check:
                 next_mode_check += self.cfg.booster.mode_check_period_s
-                self._fsm_check_robot_mode()
+                self._fsm_follow_robot()
             press = self.remoteControlService.consume_press()
             if press is not None:
                 target = self._fsm_map_press(press)
@@ -999,7 +956,8 @@ class BoosterRobotPortal:
             time.sleep(0.1)
 
         # Hand the robot back before exiting.  The executor has stopped
-        # publishing (exit_event), so only the firmware mode is switched.
+        # publishing (exit_event), so only the firmware mode is switched;
+        # in the other states the firmware controls the robot already.
         self.exit_event.set()
         if self.inference_process is not None:
             self.inference_process.join(timeout=2.0)
@@ -1009,28 +967,19 @@ class BoosterRobotPortal:
             target_mode = "damping" if damping else "walking"
             self.logger.info("Exiting from %s; switching to %s mode...",
                              current, target_mode.capitalize())
-            if not self._change_robot_mode(target_mode):
-                self.logger.error("Switching to %s mode failed",
-                                  target_mode.capitalize())
-            self._fsm.switch(ESTOP if target_mode == "damping" else IDLE)
+            reached = self._hand_back(target_mode)
+            if reached is None:
+                self.logger.error(
+                    "Handing the robot back failed; it keeps the last "
+                    "command in Custom mode")
+            else:
+                self._fsm.switch(reached)
 
     def __enter__(self) -> BoosterRobotPortal:
         return self
 
     def __exit__(self, *args) -> None:
         self.cleanup()
-
-    @staticmethod
-    def inference_process_func(
-        cfg: ControllerCfg,
-        portal: BoosterRobotPortal,
-        prepare_then_task: bool = False,
-    ) -> None:
-        controller = BoosterRobotController(cfg, portal)
-        controller.run(stop_event=portal.task_start_event if prepare_then_task else None)
-        if prepare_then_task and not portal.exit_event.is_set():
-            BoosterRobotController(portal.cfg, portal).run()
-        portal.logger.info("Inference process stopped.")
 
 
 class BoosterRobotController(BaseController):
@@ -1041,12 +990,7 @@ class BoosterRobotController(BaseController):
         super().__init__(cfg)
         self.portal = portal
         self._torque_warn_time = -1.0
-        # Walking preparation starts inference before A/r, but keeps velocity
-        # commands masked until that trigger is received.
-        self._velocity_commands_enabled = not (
-            cfg.robot.prepare_mode.strip().lower() == "walking"
-            and cfg.vel_command is not None
-        )
+        self._velocity_commands_enabled = True
 
     def update_vel_command(self):
         if not self._velocity_commands_enabled:
@@ -1124,22 +1068,15 @@ class BoosterRobotController(BaseController):
         super().stop()
         self.portal.exit_event.set()
 
-    def run(self, stop_event=None):
+    def run(self) -> None:
+        """Run the policy until it stops (the FSM executor ticks it
+        instead; see ``booster_deploy.fsm.executor``)."""
         self.update_state()
         if self.vel_command is not None:
             self.update_vel_command()
         self.start()
         next_inference_time = time.perf_counter()
-        while (
-            self.is_running
-            and not self.portal.exit_event.is_set()
-            and not (stop_event is not None and stop_event.is_set())
-        ):
-            if (
-                not self._velocity_commands_enabled
-                and self.portal.velocity_commands_enabled_event.is_set()
-            ):
-                self._velocity_commands_enabled = True
+        while self.is_running and not self.portal.exit_event.is_set():
             if time.perf_counter() < next_inference_time:
                 time.sleep(0.0002)
                 continue
@@ -1152,5 +1089,4 @@ class BoosterRobotController(BaseController):
             dof_targets = self.policy_step()
             self.ctrl_step(dof_targets)
 
-        if stop_event is None:
-            self.portal.exit_event.set()
+        self.portal.exit_event.set()

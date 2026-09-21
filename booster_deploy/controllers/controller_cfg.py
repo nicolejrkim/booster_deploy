@@ -27,33 +27,46 @@ class MujocoControllerCfg:
     ghost_rgba: List[float] = [0.2, 0.8, 0.2, 0.25]
     show_left_ui: bool = False
     show_right_ui: bool = False
+    # Headless run that writes an mp4 instead of opening the viewer (deploy.py --record): offscreen EGL render of the
+    # simulated robot + reference ghost, camera tracking the base.
+    record: Optional[str] = None
+    record_fps: int = 25
+    record_size: List[int] = [854, 480]
+    cam_distance: float = 2.4
+    cam_azimuth: float = 135.0
+    cam_elevation: float = -18.0
+    record_max_steps: Optional[int] = None  # safety cap; default = motion length + 100 control steps
 
 
 @configclass
 class BoosterRobotControllerCfg:
     metrics_max_events: int = 2000
-    # Mode to enter after Custom control exits. Supported values: "walking", "damping".
+    # Firmware mode the robot is handed to when the deployment exits from a
+    # Custom state (WALK, TASK): "walking" (Booster's controller, IDLE) or
+    # "damping" (ESTOP).  In the other states the firmware already controls
+    # the robot and is left as is.
     exit_mode: str = "walking"
-    # Seconds to interpolate from the current pose to the prepare pose when
-    # entering the STAND state.
-    stand_transition_s: float = 1.0
     # State entered when the task policy finishes (e.g. motion end):
-    # "stand" or "walk".
+    # "stand" (Prepare mode) or "walk" (the locomotion policy).
     after_task: str = "stand"
-    # Booster get-up used for ESTOP -> IDLE when the robot is not upright:
+    # Booster get-up used for IDLE -> STAND when the robot is not upright:
     # GetUpVersion (0 = V1 for K1/T1/T2, 1 = V2, K1 only) and how long to
-    # wait for the robot to be up and in Walking mode.
+    # wait for the robot to be up (the firmware gets up into Walking mode,
+    # then Prepare is requested).
     getup_version: int = 0
     getup_timeout_s: float = 20.0
-    # How often the supervisor verifies (GetStatus RPC) that the robot is
-    # still in Custom mode while a Custom state is active.
+    # How often the supervisor reads the robot's mode (GetStatus RPC) and
+    # follows it when the firmware changed mode on its own (fall protection,
+    # a restart, the operator app or remote).
     mode_check_period_s: float = 1.0
 
 
 @configclass
 class RobotCfg:
     name: str = MISSING
-    # Preparation entered after pressing X. Supported values: "walking", "standing".
+    # Where A goes from STAND: "walking" inserts WALK (the robot's locomotion
+    # policy, tasks/locomotion) before TASK, "standing" enters TASK straight
+    # from Prepare mode.
     prepare_mode: str = "walking"
 
     joint_names: list[str] = MISSING

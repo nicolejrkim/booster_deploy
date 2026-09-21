@@ -96,11 +96,13 @@ class RemoteControlService:
         return "Press keyboard 'x' to start custom mode."
 
     def get_fsm_operation_hint(self) -> str:
+        states = ("STAND=Prepare mode, WALK=locomotion policy (sticks), "
+                  "TASK=task policy, ESTOP=Damping mode")
         if self.joystick is not None:
-            return ("Remote: X=STAND, A=forward (WALK/TASK), Y=back, "
-                    "B=ESTOP; keyboard: x, r, n, b. Ctrl+C exits.")
-        return ("Keyboard: x=STAND, r=forward (WALK/TASK), n=back, b=ESTOP "
-                "(remote X/A/Y/B on the topic). Ctrl+C exits.")
+            return (f"Remote: X=STAND, A=forward (WALK/TASK), Y=back, "
+                    f"B=ESTOP; keyboard: x, r, n, b. {states}. Ctrl+C exits.")
+        return (f"Keyboard: x=STAND, r=forward (WALK/TASK), n=back, b=ESTOP "
+                f"(remote X/A/Y/B on the topic). {states}. Ctrl+C exits.")
 
     def get_rl_gait_operation_hint(self) -> str:
         # Keep the mode-switch prompt consistent across joystick, ROS topic,
@@ -425,6 +427,13 @@ class RemoteControlService:
         if abs(mapped_value) < threshold:
             return 0.0
         return -mapped_value
+
+    def reset_velocity(self) -> None:
+        """Zero the velocity command (the keyboard's is latched)."""
+        with self._lock:
+            self.vx = 0.0
+            self.vy = 0.0
+            self.vyaw = 0.0
 
     def get_vx_cmd(self) -> float:
         """Get forward velocity command."""

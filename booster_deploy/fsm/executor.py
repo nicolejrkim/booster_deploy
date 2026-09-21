@@ -4,12 +4,11 @@ The portal (main process) owns the ROS 2 I/O and the Loco RPC and decides
 which state is requested; this executor runs in the inference process at
 ``policy_dt`` and performs the state's control behaviour:
 
-- ``STAND``: interpolate to the prepare pose, then hold it with the prepare
-  gains;
 - ``WALK`` / ``TASK``: step a :class:`BoosterRobotController` (policy
-  inference + ``/joint_ctrl`` publishing);
+  inference + ``/joint_ctrl`` publishing) in the firmware's Custom mode;
 - ``ESTOP``: publish one damping command (Kp 0), then nothing;
-- ``IDLE``: publish nothing.
+- ``IDLE`` / ``STAND``: publish nothing; the firmware's own controller
+  (Damping, Prepare or Walking mode) owns the joints.
 
 Both policy controllers are constructed up-front so that switching states
 never stalls on model loading.
@@ -26,7 +25,6 @@ import logging
 import time
 from typing import TYPE_CHECKING, Optional
 
-import numpy as np
 import rclpy
 from booster_interface.msg import LowCmd
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -34,9 +32,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from ..controllers.base_controller import BaseController
 from ..controllers.booster_robot_controller import BoosterRobotController
 from ..controllers.controller_cfg import ControllerCfg
-from .booster_states import (
-    ESTOP, STAND, TASK, WALK, state_index, state_name,
-)
+from .booster_states import ESTOP, STAND, TASK, WALK, state_index, state_name
 
 if TYPE_CHECKING:
     from ..controllers.booster_robot_controller import BoosterRobotPortal
@@ -77,39 +73,6 @@ class FsmPolicyController(BoosterRobotController):
         self._executor.request(self._executor.after_task, "policy finished")
 
 
-class StandBehaviour:
-    """PD hold of the prepare pose with the prepare gains."""
-
-    def __init__(self, portal: "BoosterRobotPortal", transition_s: float):
-        self.portal = portal
-        self.prepare = portal.robot.cfg.prepare_state
-        self.transition_s = float(transition_s)
-        self.target = np.asarray(self.prepare.joint_pos, dtype=np.float64)
-        self._start_pose = self.target.copy()
-        self._t0 = 0.0
-
-    def enter(self) -> None:
-        state = self.portal.synced_state.read()[0]
-        self._start_pose = state["joint_pos"].copy()
-        self._t0 = time.perf_counter()
-
-    def step(self) -> None:
-        if self.transition_s > 0.0:
-            elapsed = time.perf_counter() - self._t0
-            alpha = min(1.0, elapsed / self.transition_s)
-        else:
-            alpha = 1.0
-        q = self._start_pose + alpha * (self.target - self._start_pose)
-        motor_cmd = self.portal.motor_cmd
-        for i in range(len(q)):
-            motor_cmd[i].q = float(q[i])
-            motor_cmd[i].dq = 0.0
-            motor_cmd[i].tau = 0.0
-            motor_cmd[i].kp = float(self.prepare.stiffness[i])
-            motor_cmd[i].kd = float(self.prepare.damping[i])
-        self.portal.low_cmd_publisher.publish(self.portal.low_cmd)
-
-
 class FsmExecutor:
     def __init__(
         self,
@@ -126,7 +89,6 @@ class FsmExecutor:
                 f"{task_cfg.booster.after_task!r}")
         if self.after_task == WALK and walk_cfg is None:
             self.after_task = STAND
-        self.stand = StandBehaviour(portal, task_cfg.booster.stand_transition_s)
         self.walk = (FsmPolicyController(walk_cfg, portal, self)
                      if walk_cfg is not None else None)
         self.task = FsmPolicyController(task_cfg, portal, self)
@@ -144,13 +106,9 @@ class FsmExecutor:
         if target == self.active:
             return
         logger.info("FSM executor: %s -> %s", self.active, target)
-        if target == STAND:
-            self.stand.enter()
-        elif target == WALK:
-            if self.walk is None:
-                logger.error("no locomotion policy for WALK; holding STAND")
-                target = STAND
-                self.stand.enter()
+        if target == WALK:
+            if self.walk is None:  # the portal refuses WALK in this case
+                logger.error("no locomotion policy for WALK; not publishing")
             else:
                 self.walk.update_state()
                 self.walk.start()
@@ -196,13 +154,11 @@ class FsmExecutor:
                 if requested != self.active:
                     self._switch(requested)
 
-            if self.active == STAND:
-                self.stand.step()
-            elif self.active == WALK and self.walk is not None:
+            if self.active == WALK and self.walk is not None:
                 self.walk.tick()
             elif self.active == TASK:
                 self.task.tick()
-            # ESTOP / IDLE: nothing to publish
+            # IDLE / STAND / ESTOP: the firmware owns the joints
         logger.info("FSM executor stopped in %s", self.active)
 
 

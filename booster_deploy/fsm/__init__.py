@@ -5,6 +5,7 @@ from .booster_states import (
     CUSTOM_STATES,
     ESTOP,
     IDLE,
+    ROBOT_MODE,
     STAND,
     STATES,
     TASK,
@@ -16,6 +17,7 @@ from .booster_states import (
 
 __all__ = [
     "StateMachine",
-    "CUSTOM_STATES", "ESTOP", "IDLE", "STAND", "STATES", "TASK",
+    "CUSTOM_STATES", "ESTOP", "IDLE", "ROBOT_MODE", "STAND", "STATES",
+    "TASK",
     "TRANSITIONS", "WALK", "state_index", "state_name",
 ]
