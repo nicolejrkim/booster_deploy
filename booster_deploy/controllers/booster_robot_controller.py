@@ -86,6 +86,9 @@ class BoosterRobotPortal:
         self.fsm_requested = mp.Value("i", 0)
         self.fsm_active = mp.Value("i", 0)
         self.fsm_executor_request = mp.Value("i", -1)
+        # Set by the executor once both policy controllers are built; no
+        # transition is performed before that.
+        self.fsm_executor_ready = mp.Value("i", 0)
         self._fsm = None
         self._fsm_walk_first = False
         # Robot mode last seen by the mode watchdog, to log changes once.
@@ -651,6 +654,14 @@ class BoosterRobotPortal:
             self._fsm_publish_result(
                 "REJECTED", target, "no locomotion policy for this robot")
             return False
+        if not self.fsm_executor_ready.value:
+            # Never switch the firmware on behalf of an executor that cannot
+            # take over (still loading, or stuck in its start-up).
+            self.logger.warning(
+                "FSM executor is not ready yet; %s refused", target)
+            self._fsm_publish_result(
+                "REJECTED", target, "executor not ready (still starting)")
+            return False
         current = fsm.current
         if target == WALK:
             # A latched keyboard velocity must not make the robot walk off.
@@ -916,7 +927,19 @@ class BoosterRobotPortal:
         self._fsm_print_state()
 
         next_mode_check = time.perf_counter()
+        executor_started = time.perf_counter()
+        next_ready_warn = executor_started + 5.0
         while self.is_running and not self.exit_event.is_set():
+            if (not self.fsm_executor_ready.value
+                    and time.perf_counter() >= next_ready_warn):
+                pid = self.inference_process.pid
+                self.logger.warning(
+                    "FSM executor (pid %s) not ready after %.0fs: still "
+                    "loading the policies, or stuck starting up "
+                    "(py-spy dump --pid %s shows where); transitions are "
+                    "refused until it reports ready",
+                    pid, time.perf_counter() - executor_started, pid)
+                next_ready_warn += 10.0
             self._fsm_sync_from_executor()
             if time.perf_counter() >= next_mode_check:
                 next_mode_check += self.cfg.booster.mode_check_period_s

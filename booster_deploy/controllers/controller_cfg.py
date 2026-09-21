@@ -49,6 +49,15 @@ class BoosterRobotControllerCfg:
     # State entered when the task policy finishes (e.g. motion end):
     # "stand" (Prepare mode) or "walk" (the locomotion policy).
     after_task: str = "stand"
+    # The FSM executor child publishes /joint_ctrl through the publisher it
+    # inherits from the portal, as Booster's own inference process does
+    # (validated on the robot).  True makes the child create its own ROS 2
+    # context, node and publisher, so subscribers that appear after the
+    # fork (a monitor started later, a restarted simulator) also receive
+    # the commands; creating DDS entities in a forked process can hang on
+    # some Fast DDS builds, so it is off on the robot; deploy.py turns it
+    # on for --sim and --monitor.
+    executor_ros_context: bool = False
     # Booster get-up used for IDLE -> STAND when the robot is not upright:
     # GetUpVersion (0 = V1 for K1/T1/T2, 1 = V2, K1 only) and how long to
     # wait for the robot to be up (the firmware gets up into Walking mode,

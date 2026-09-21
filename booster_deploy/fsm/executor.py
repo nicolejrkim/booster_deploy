@@ -13,15 +13,21 @@ which state is requested; this executor runs in the inference process at
 Both policy controllers are constructed up-front so that switching states
 never stalls on model loading.
 
-The child creates its own ROS 2 context, node and ``/joint_ctrl`` publisher:
-a publisher inherited across ``fork`` keeps working for subscribers matched
-before the fork, but the DDS discovery threads do not survive the fork, so
-subscribers that appear later (a monitor, a restarted simulator) would never
-receive anything.
+The child publishes ``/joint_ctrl`` through the publisher it inherits from
+the portal, as Booster's own inference process does.  With
+``booster.executor_ros_context`` it creates its own ROS 2 context, node and
+publisher instead: an inherited publisher keeps working for subscribers
+matched before the fork, but the DDS discovery threads do not survive the
+fork, so subscribers that appear later (a monitor, a restarted simulator)
+would never receive anything.  Creating DDS entities in a forked process can
+hang on some Fast DDS builds, which is why the inherited publisher is the
+default on the robot.  Either way the child reports readiness through
+``portal.fsm_executor_ready`` once both policy controllers are built.
 """
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -168,18 +174,30 @@ def fsm_process_func(
     walk_cfg: Optional[ControllerCfg],
 ) -> None:
     """Entry point of the inference process."""
-    context = rclpy.Context()
-    rclpy.init(context=context)
-    node = rclpy.create_node("booster_deploy_fsm_executor", context=context)
-    # Replace the inherited publisher (see the module docstring); the
-    # controllers and behaviours publish through ``portal.low_cmd_publisher``.
-    portal.low_cmd_publisher = node.create_publisher(
-        LowCmd, "joint_ctrl",
-        QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
-                   history=HistoryPolicy.KEEP_LAST),
-    )
+    t0 = time.perf_counter()
+    context = node = None
+    if task_cfg.booster.executor_ros_context:
+        # Replace the inherited publisher (see the module docstring); the
+        # controllers publish through ``portal.low_cmd_publisher``.
+        context = rclpy.Context()
+        rclpy.init(context=context)
+        node = rclpy.create_node(
+            "booster_deploy_fsm_executor", context=context)
+        portal.low_cmd_publisher = node.create_publisher(
+            LowCmd, "joint_ctrl",
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       history=HistoryPolicy.KEEP_LAST),
+        )
+        logger.info("FSM executor: own ROS 2 node up after %.1fs",
+                    time.perf_counter() - t0)
     try:
-        FsmExecutor(portal, task_cfg, walk_cfg).run()
+        executor = FsmExecutor(portal, task_cfg, walk_cfg)
+        portal.fsm_executor_ready.value = 1
+        logger.info("FSM executor ready after %.1fs (pid %d, walk %s)",
+                    time.perf_counter() - t0, os.getpid(),
+                    "yes" if executor.walk is not None else "no")
+        executor.run()
     finally:
-        node.destroy_node()
-        rclpy.shutdown(context=context)
+        if node is not None:
+            node.destroy_node()
+            rclpy.shutdown(context=context)

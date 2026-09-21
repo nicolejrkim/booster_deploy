@@ -678,6 +678,17 @@ any --B--> ESTOP --Y--> IDLE                      Ctrl+C: exit_mode, then quit
   Damping) and the verdict names the state reached.
 - The velocity command is zeroed when `WALK` is entered, so a keyboard
   velocity left over from before does not make the robot walk off.
+- The executor child loads both policies at start-up and then logs
+  `FSM executor ready after N s`. Until then every request is answered
+  `REJECTED <state>: executor not ready` and the firmware is not touched;
+  if it is not ready after 5 s the deploy warns with the child's PID
+  (`py-spy dump --pid <PID>` shows where it is). On the robot the child
+  publishes `/joint_ctrl` through the publisher inherited from the main
+  process, as Booster's own inference process does. `--sim` and
+  `--monitor` make it create its own ROS 2 node and publisher instead
+  (`--executor-ros-context` forces it), which is what a simulator or a
+  monitor started after the deploy needs to receive the commands, and
+  which some Fast DDS builds cannot do safely in a forked process.
 - A policy's safety fallback moves to `ESTOP`; a policy that finishes (for
   example a motion with `stop_at_motion_end`) moves to `booster.after_task`
   (`"stand"` by default, or `"walk"`).

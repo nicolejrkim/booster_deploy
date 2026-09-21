@@ -103,6 +103,11 @@ side effect of import; a new task only needs its package and a
   `after_task` (policy `finish()`). The deploy starts in the state matching
   the robot's mode (Walking counts as IDLE) and follows the firmware when it
   changes mode on its own. Ctrl+C hands back per `exit_mode` from WALK/TASK.
+  The executor reports readiness (`fsm_executor_ready`) after loading both
+  policies; transitions are refused before that. On the robot it publishes
+  through the inherited `/joint_ctrl` publisher (upstream behaviour);
+  `booster.executor_ros_context` (set by `--sim`/`--monitor`) gives it its
+  own ROS 2 node, which a forked process cannot always create safely.
 
 ## BM154 (tasks/bm154)
 

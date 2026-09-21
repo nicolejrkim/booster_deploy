@@ -40,6 +40,12 @@ parser.add_argument(
          "simulated robot + reference ghost, start to end of the motion")
 parser.add_argument("--record-fps", type=int, default=25)
 parser.add_argument(
+    "--executor-ros-context", action="store_true", default=False,
+    help="let the FSM executor child create its own ROS 2 node and "
+         "/joint_ctrl publisher (implied by --sim and --monitor). Off by "
+         "default: the child publishes through the inherited publisher, as "
+         "Booster's own inference process does on the robot.")
+parser.add_argument(
     "--exit-mode",
     choices=("walking", "damping"),
     default=None,
@@ -137,6 +143,10 @@ def main():
     task_cfg.policy.device = args.device
     if args.exit_mode is not None:
         task_cfg.booster.exit_mode = args.exit_mode
+    if args.sim or args.monitor or args.executor_ros_context:
+        # Workstation cases: the simulator and a monitor started after the
+        # fork need the child's own publisher.  Left off on the robot.
+        task_cfg.booster.executor_ros_context = True
 
     if args.sim and args.mujoco:
         parser.error("--sim and --mujoco are mutually exclusive")
