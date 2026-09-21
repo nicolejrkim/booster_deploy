@@ -6,7 +6,8 @@ deployment state machine: X (or ``x``) enters Custom mode with the prepare
 stage selected by ``robot.prepare_mode``, A (or ``r``) starts the task policy,
 Ctrl+C hands the robot back per ``booster.exit_mode``.  The inference process
 publishes through the publisher inherited from the portal.  No monitor
-topics, no verdicts, no get-up: exactly what Booster validated on the robot.
+topics, no verdicts, no get-up: what Booster validated on the robot, plus
+the release of the shared-memory buffers at exit (see ``cleanup``).
 """
 from __future__ import annotations
 import json
@@ -627,6 +628,14 @@ class BoosterRobotPortal:
                 f"mean_period={stats['mean_period_s']}, "
                 f"min={stats['min_period_s']}, max={stats['max_period_s']}"
             )
+        # Release the shared-memory segments explicitly (the one change to
+        # the upstream file): the inference process has exited above, and
+        # without this Python's resource tracker reports them as leaked at
+        # shutdown.
+        for arr in (self.synced_state, self.synced_command, self.synced_action):
+            arr.cleanup()
+        for metric in self.metrics.values():
+            metric._arr.cleanup()
 
     def run(self):
         """Main loop: monitor inference process and diagnostics (10Hz)."""
