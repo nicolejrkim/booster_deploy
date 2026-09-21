@@ -388,6 +388,22 @@ that nothing answers within 2 s is reported as `NO RESPONSE`, which means no
    python scripts/deploy.py --task <TASK_NAME>
    ```
 
+#### Running without the state machine (`--no-fsm`)
+
+> **Added in this branch.** The state machine is the branch's own; this flag
+> restores what `main` does.
+
+`python scripts/deploy.py --task <TASK_NAME> --no-fsm` runs Booster's
+original flow, kept verbatim from upstream in
+`booster_deploy/controllers/legacy_portal.py`: `X` (keyboard `x`) enters
+Custom mode with the prepare stage selected by `robot.prepare_mode`
+(`"walking"`: the locomotion policy holds the robot with zero velocity
+until `A`; `"standing"`: a one-second move to `prepare_state.joint_pos`),
+`A` (keyboard `r`) starts the task policy, and `Ctrl+C` hands the robot
+back per `booster.exit_mode`. There is no `STAND`/Prepare state, no get-up,
+no `booster_deploy/fsm_*` topics and no verdicts, so the monitor shows the
+pose but no state. It works with `--sim` too.
+
 #### Running from the workstation over an Ethernet cable
 
 > **Added in this branch.** `scripts/robot_link.sh`, `booster_link_check`

@@ -49,6 +49,7 @@ source .venv/bin/activate                 # see README for venv setup
 python scripts/deploy.py --list           # registered tasks
 python scripts/deploy.py --task <name> --mujoco   # sim2sim (needs booster_assets)
 python scripts/deploy.py --task <name>            # real robot (needs ROS 2)
+python scripts/deploy.py --task <name> --no-fsm   # Booster's original flow (legacy_portal.py): x = Custom mode, r = policy
 python scripts/deploy.py --task <name> --sim      # same path against a simulated robot it starts itself
 python scripts/deploy.py --task <name> --sim --monitor  # plus the live monitor; simulator headless, one window
 python scripts/sim_robot.py --robot k1 --viewer   # simulated robot for the line above

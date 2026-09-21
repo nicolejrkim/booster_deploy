@@ -40,6 +40,12 @@ parser.add_argument(
          "simulated robot + reference ghost, start to end of the motion")
 parser.add_argument("--record-fps", type=int, default=25)
 parser.add_argument(
+    "--no-fsm", action="store_true", default=False,
+    help="run Booster's original flow instead of the state machine: X/x "
+         "enters Custom mode (prepare per robot.prepare_mode), A/r starts "
+         "the task policy, Ctrl+C hands back per exit_mode; no monitor "
+         "topics or verdicts")
+parser.add_argument(
     "--executor-ros-context", action="store_true", default=False,
     help="let the FSM executor child create its own ROS 2 node and "
          "/joint_ctrl publisher (implied by --sim and --monitor). Off by "
@@ -166,7 +172,12 @@ def main():
 
         MujocoController(task_cfg).run()
     else:
-        from booster_deploy.controllers.booster_robot_controller import BoosterRobotPortal
+        if args.no_fsm:
+            from booster_deploy.controllers.legacy_portal import (
+                BoosterRobotPortal)
+        else:
+            from booster_deploy.controllers.booster_robot_controller import (
+                BoosterRobotPortal)
         sim_process = start_simulated_robot(task_cfg) if args.sim else None
         monitor_process = start_monitor(task_cfg) if args.monitor else None
         try:
