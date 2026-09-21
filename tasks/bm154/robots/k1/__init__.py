@@ -109,7 +109,9 @@ register_task("k1_bm154_floss", K1BM154FlossControllerCfg())
 register_task("k1_bm154_boogle", K1BM154BoogleControllerCfg())
 
 
-# --- seedpicks BM154 policies (fork Tracking-Flat-K1-BM154-v0 on the k1b15 STMR rollouts, 09-20), exported 09-21 ----------
+# --- seedpicks BM154 policies ----------------------------------------------
+# (Tracking-Flat-K1-BM154-v0 on the k1b15 STMR retargets, trained 2026-09-20,
+# exported 2026-09-21.)
 def register_bm154_seedpicks(task_name: str, motion_name: str) -> None:
     cfg = K1BM154ControllerCfg()
     cfg.policy.motion_path = f"robots/k1/motions/{motion_name}.npz"

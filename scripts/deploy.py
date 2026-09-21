@@ -36,8 +36,8 @@ parser.add_argument(
     help="Device to run the evaluation on (e.g., 'cpu', 'cuda')")
 parser.add_argument(
     "--record", type=str, default=None,
-    help="with --mujoco: run headless (EGL) and write this mp4 of the simulated robot + reference ghost, "
-         "start to end of the motion")
+    help="with --mujoco: run headless (EGL) and write this mp4 of the "
+         "simulated robot + reference ghost, start to end of the motion")
 parser.add_argument("--record-fps", type=int, default=25)
 parser.add_argument(
     "--exit-mode",
