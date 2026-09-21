@@ -6,6 +6,7 @@ import subprocess
 import sys
 
 sys.path.append(".")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 parser = argparse.ArgumentParser()
 # require either --task or --list (mutually exclusive)
@@ -117,6 +118,45 @@ def start_monitor(task_cfg):
     return start_helper("Monitor", "monitor.py", script_args, "monitor.log")
 
 
+def missing_policy_files(task_cfg):
+    """Policy and motion files a task needs that are not on disk.
+
+    Paths are relative to the policy's task package, as the policies resolve
+    them; the robot's locomotion policy (walking preparation / WALK) is
+    checked too.
+    """
+    import sys as _sys
+    cfgs = [task_cfg]
+    robot_name = task_cfg.robot.name.lower()
+    try:
+        if "t2" in robot_name:
+            from tasks.locomotion.robots.t2 import T2WalkTaskCfg as Walk
+        elif "t1" in robot_name:
+            from tasks.locomotion.robots.t1 import T1WalkControllerCfg1 as Walk
+        elif "k1" in robot_name:
+            from tasks.locomotion.robots.k1 import K1WalkTaskCfg as Walk
+        else:
+            Walk = None
+        if Walk is not None:
+            cfgs.append(Walk())
+    except Exception:
+        pass
+    missing = []
+    for cfg in cfgs:
+        policy_cls = cfg.policy.constructor
+        task_path = os.path.dirname(
+            _sys.modules[policy_cls.__module__].__file__)
+        for attr in ("checkpoint_path", "motion_path"):
+            path = getattr(cfg.policy, attr, None)
+            if not isinstance(path, str):
+                continue
+            full = (path if os.path.isabs(path)
+                    else os.path.join(task_path, path))
+            if not os.path.isfile(full):
+                missing.append(os.path.relpath(full, REPO_ROOT))
+    return missing
+
+
 def main():
     # load task registry and dispatch
     import pkgutil
@@ -136,7 +176,9 @@ def main():
         for task_name, cfg in list_tasks().items():
             cls = type(cfg)
             full_cls = f"{cls.__module__}.{cls.__qualname__}"
-            print(f"  {task_name}\t:\t{full_cls}")
+            missing = missing_policy_files(cfg)
+            note = f"\t(files missing: {len(missing)})" if missing else ""
+            print(f"  {task_name}\t:\t{full_cls}{note}")
         sys.exit(0)
 
     try:
@@ -149,6 +191,12 @@ def main():
     task_cfg.policy.device = args.device
     if args.exit_mode is not None:
         task_cfg.booster.exit_mode = args.exit_mode
+    missing = missing_policy_files(task_cfg)
+    if missing:
+        parser.error(
+            f"task '{args.task}' cannot run, these files are not on disk "
+            "(not committed, or not copied to this machine):\n  "
+            + "\n  ".join(missing))
     if args.sim or args.monitor or args.executor_ros_context:
         # Workstation cases: the simulator and a monitor started after the
         # fork need the child's own publisher.  Left off on the robot.
