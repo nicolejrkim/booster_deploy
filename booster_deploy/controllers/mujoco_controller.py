@@ -119,7 +119,8 @@ class MujocoController(BaseController):
         qpos_np = qpos_np.astype(np.float32, copy=False).reshape(-1)
         if qpos_np.shape[0] != int(self.mj_model.nq):
             raise ValueError(
-                f"reference qpos must have shape (nq,), got {qpos_np.shape} (nq={int(self.mj_model.nq)})"
+                "reference qpos must have shape (nq,), got "
+                f"{qpos_np.shape} (nq={int(self.mj_model.nq)})"
             )
         self._reference_qpos = qpos_np.copy()
         # FK + offset
@@ -141,7 +142,8 @@ class MujocoController(BaseController):
             try:
                 parts = sys.stdin.readline().strip().split()
                 if len(parts) == 3:
-                    (cmd.lin_vel_x, cmd.lin_vel_y, cmd.ang_vel_yaw) = map(float, parts)
+                    (cmd.lin_vel_x, cmd.lin_vel_y,
+                     cmd.ang_vel_yaw) = map(float, parts)
                     cmd.lin_vel_x = cmd.clamp_vx(cmd.lin_vel_x)
                     print(
                         f"Updated command to: x={cmd.lin_vel_x},"
@@ -246,30 +248,45 @@ class MujocoController(BaseController):
             dof_vel = self.mj_data.qvel.astype(np.float32)[6:]
 
     def run_record(self) -> None:
-        """Headless rollout written to cfg.mujoco.record (mp4): same policy/PD loop as run(), no real-time pacing,
-        offscreen render of the simulated robot with the reference ghost, free camera tracking the base."""
+        """Headless rollout written to ``cfg.mujoco.record`` (mp4).
+
+        Same policy/PD loop as ``run()`` without real-time pacing; offscreen
+        render of the simulated robot with the reference ghost, free camera
+        tracking the base.
+        """
         import os
         import subprocess
         cfg = self.cfg.mujoco
         w, h = int(cfg.record_size[0]), int(cfg.record_size[1])
-        self.mj_model.vis.global_.offwidth = max(int(self.mj_model.vis.global_.offwidth), w)
-        self.mj_model.vis.global_.offheight = max(int(self.mj_model.vis.global_.offheight), h)
+        vis = self.mj_model.vis.global_
+        vis.offwidth = max(int(vis.offwidth), w)
+        vis.offheight = max(int(vis.offheight), h)
         renderer = mujoco.Renderer(self.mj_model, height=h, width=w)
         cam = mujoco.MjvCamera()
         cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        cam.distance, cam.azimuth, cam.elevation = cfg.cam_distance, cfg.cam_azimuth, cfg.cam_elevation
+        cam.distance = cfg.cam_distance
+        cam.azimuth = cfg.cam_azimuth
+        cam.elevation = cfg.cam_elevation
         opt = mujoco.MjvOption()
         pert = mujoco.MjvPerturb()
         ctrl_hz = 1.0 / (cfg.physics_dt * cfg.decimation)
         stride = max(1, int(round(ctrl_hz / cfg.record_fps)))
-        os.makedirs(os.path.dirname(os.path.abspath(cfg.record)), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(cfg.record)),
+                    exist_ok=True)
         ff = subprocess.Popen(
-            ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
-             "-r", str(int(round(ctrl_hz / stride))), "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-             "-crf", "23", "-movflags", "+faststart", cfg.record],
+            ["ffmpeg", "-v", "error", "-y",
+             "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
+             "-r", str(int(round(ctrl_hz / stride))), "-i", "-",
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23",
+             "-movflags", "+faststart", cfg.record],
             stdin=subprocess.PIPE)
         motion = getattr(self.policy, "motion", None)
-        max_steps = cfg.record_max_steps or (int(getattr(motion, "time_step_total", 0)) + 100 if motion is not None else 3000)
+        if cfg.record_max_steps:
+            max_steps = cfg.record_max_steps
+        elif motion is not None:
+            max_steps = int(getattr(motion, "time_step_total", 0)) + 100
+        else:
+            max_steps = 3000
         self.update_state()
         self.start()
         step = 0
@@ -280,13 +297,17 @@ class MujocoController(BaseController):
                 dof_targets = self.policy_step()
                 self.ctrl_step(dof_targets)
                 if step % stride == 0:
-                    lookat = 0.9 * lookat + 0.1 * self.mj_data.qpos[0:3].astype(np.float64)
+                    base = self.mj_data.qpos[0:3].astype(np.float64)
+                    lookat = 0.9 * lookat + 0.1 * base
                     cam.lookat[:] = lookat
                     renderer.update_scene(self.mj_data, cam, opt)
                     if cfg.visualize_reference_ghost:
                         n0 = renderer.scene.ngeom
-                        mujoco.mjv_addGeoms(self.mj_model, self._ghost_mj_data, self._ghost_scene_option, pert,
-                                            int(mujoco.mjtCatBit.mjCAT_DYNAMIC), renderer.scene)
+                        mujoco.mjv_addGeoms(
+                            self.mj_model, self._ghost_mj_data,
+                            self._ghost_scene_option, pert,
+                            int(mujoco.mjtCatBit.mjCAT_DYNAMIC),
+                            renderer.scene)
                         for i in range(n0, renderer.scene.ngeom):
                             renderer.scene.geoms[i].rgba[:] = self._ghost_rgba
                     ff.stdin.write(renderer.render().tobytes())
@@ -304,8 +325,10 @@ class MujocoController(BaseController):
             self.mj_model,
             self.mj_data,
             key_callback=self._on_mujoco_key,
-            show_left_ui=bool(getattr(self.cfg.mujoco, "show_left_ui", False)),
-            show_right_ui=bool(getattr(self.cfg.mujoco, "show_right_ui", False)),
+            show_left_ui=bool(
+                getattr(self.cfg.mujoco, "show_left_ui", False)),
+            show_right_ui=bool(
+                getattr(self.cfg.mujoco, "show_right_ui", False)),
         ) as viewer:
 
             self.viewer = viewer
@@ -324,11 +347,12 @@ class MujocoController(BaseController):
                 self.ctrl_step(dof_targets)
 
                 if self.cfg.mujoco.visualize_reference_ghost:
-                    # Render kinematic "ghost" robot from generalized coordinates.
+                    # Render the kinematic "ghost" robot from its qpos.
                     self.render_reference_robot(
                         viewer,
                         rgba=self._ghost_rgba,
                     )
 
-                self.viewer.cam.lookat[:] = self.mj_data.qpos.astype(np.float32)[0:3]
+                self.viewer.cam.lookat[:] = (
+                    self.mj_data.qpos.astype(np.float32)[0:3])
                 self.viewer.sync()
