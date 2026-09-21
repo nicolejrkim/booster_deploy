@@ -35,6 +35,11 @@ parser.add_argument(
     "--device", type=str, default="cpu",
     help="Device to run the evaluation on (e.g., 'cpu', 'cuda')")
 parser.add_argument(
+    "--record", type=str, default=None,
+    help="with --mujoco: run headless (EGL) and write this mp4 of the simulated robot + reference ghost, "
+         "start to end of the motion")
+parser.add_argument("--record-fps", type=int, default=25)
+parser.add_argument(
     "--exit-mode",
     choices=("walking", "damping"),
     default=None,
@@ -140,6 +145,12 @@ def main():
 
     # decide how to run based on flags
     if args.mujoco:
+        if args.record:
+            os.environ.setdefault("MUJOCO_GL", "egl")
+            task_cfg.mujoco.record = args.record
+            task_cfg.mujoco.record_fps = args.record_fps
+            if hasattr(task_cfg.policy, "stop_at_motion_end"):
+                task_cfg.policy.stop_at_motion_end = True
         # run mujoco controller
         from booster_deploy.controllers.mujoco_controller import MujocoController
 

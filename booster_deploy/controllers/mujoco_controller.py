@@ -245,7 +245,61 @@ class MujocoController(BaseController):
             dof_pos = self.mj_data.qpos.astype(np.float32)[7:]
             dof_vel = self.mj_data.qvel.astype(np.float32)[6:]
 
+    def run_record(self) -> None:
+        """Headless rollout written to cfg.mujoco.record (mp4): same policy/PD loop as run(), no real-time pacing,
+        offscreen render of the simulated robot with the reference ghost, free camera tracking the base."""
+        import os
+        import subprocess
+        cfg = self.cfg.mujoco
+        w, h = int(cfg.record_size[0]), int(cfg.record_size[1])
+        self.mj_model.vis.global_.offwidth = max(int(self.mj_model.vis.global_.offwidth), w)
+        self.mj_model.vis.global_.offheight = max(int(self.mj_model.vis.global_.offheight), h)
+        renderer = mujoco.Renderer(self.mj_model, height=h, width=w)
+        cam = mujoco.MjvCamera()
+        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        cam.distance, cam.azimuth, cam.elevation = cfg.cam_distance, cfg.cam_azimuth, cfg.cam_elevation
+        opt = mujoco.MjvOption()
+        pert = mujoco.MjvPerturb()
+        ctrl_hz = 1.0 / (cfg.physics_dt * cfg.decimation)
+        stride = max(1, int(round(ctrl_hz / cfg.record_fps)))
+        os.makedirs(os.path.dirname(os.path.abspath(cfg.record)), exist_ok=True)
+        ff = subprocess.Popen(
+            ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}",
+             "-r", str(int(round(ctrl_hz / stride))), "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-crf", "23", "-movflags", "+faststart", cfg.record],
+            stdin=subprocess.PIPE)
+        motion = getattr(self.policy, "motion", None)
+        max_steps = cfg.record_max_steps or (int(getattr(motion, "time_step_total", 0)) + 100 if motion is not None else 3000)
+        self.update_state()
+        self.start()
+        step = 0
+        lookat = self.mj_data.qpos[0:3].astype(np.float64).copy()
+        try:
+            while self.is_running and step < max_steps:
+                self.update_state()
+                dof_targets = self.policy_step()
+                self.ctrl_step(dof_targets)
+                if step % stride == 0:
+                    lookat = 0.9 * lookat + 0.1 * self.mj_data.qpos[0:3].astype(np.float64)
+                    cam.lookat[:] = lookat
+                    renderer.update_scene(self.mj_data, cam, opt)
+                    if cfg.visualize_reference_ghost:
+                        n0 = renderer.scene.ngeom
+                        mujoco.mjv_addGeoms(self.mj_model, self._ghost_mj_data, self._ghost_scene_option, pert,
+                                            int(mujoco.mjtCatBit.mjCAT_DYNAMIC), renderer.scene)
+                        for i in range(n0, renderer.scene.ngeom):
+                            renderer.scene.geoms[i].rgba[:] = self._ghost_rgba
+                    ff.stdin.write(renderer.render().tobytes())
+                step += 1
+        finally:
+            ff.stdin.close()
+            ff.wait()
+            renderer.close()
+        print(f"[MuJoCo] recorded {step} control steps -> {cfg.record}")
+
     def run(self):
+        if getattr(self.cfg.mujoco, "record", None):
+            return self.run_record()
         with mujoco.viewer.launch_passive(
             self.mj_model,
             self.mj_data,

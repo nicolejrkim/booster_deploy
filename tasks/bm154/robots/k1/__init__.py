@@ -107,3 +107,24 @@ class K1BM154BoogleControllerCfg(K1BM154ControllerCfg):
 register_task("k1_bm154_jamesbrown", K1BM154JamesBrownControllerCfg())
 register_task("k1_bm154_floss", K1BM154FlossControllerCfg())
 register_task("k1_bm154_boogle", K1BM154BoogleControllerCfg())
+
+
+# --- seedpicks BM154 policies (fork Tracking-Flat-K1-BM154-v0 on the k1b15 STMR rollouts, 09-20), exported 09-21 ----------
+def register_bm154_seedpicks(task_name: str, motion_name: str) -> None:
+    cfg = K1BM154ControllerCfg()
+    cfg.policy.motion_path = f"robots/k1/motions/{motion_name}.npz"
+    cfg.policy.checkpoint_path = f"robots/k1/models/{motion_name}_bm154.pt"
+    register_task(task_name, cfg)
+
+
+BM154_SEEDPICKS = [
+    ("sp_frog_jump_a360", "spk1_frog_jump_002__A360_k1b15_stmr"),
+    ("sp_high_jump_a277", "spk1_high_jump_R_001__A277_k1b15_stmr"),
+    ("sp_jump_sideway_090_a024", "spk1_jump_sideway_090_002__A024_k1b15_stmr"),
+    ("sp_scissors_jump_a360", "spk1_scissors_jump_R_003__A360_k1b15_stmr"),
+    ("sp_ib_dodge_270_a437", "spk1_ib_dodge_270_R_001__A437_k1b15_stmr"),
+    ("sp_turn_jump_0045_a023", "spk1_turn_jump_0045_007__A023_k1b15_stmr"),
+    ("sp_turn_jump_135_a037", "spk1_turn_jump_135_002__A037_k1b15_stmr"),
+]
+for _name, _stem in BM154_SEEDPICKS:
+    register_bm154_seedpicks(f"k1_bm154_{_name}", _stem)
